@@ -1,0 +1,46 @@
+{
+  "schema_version": "1.0",
+  "concept": "TreeNode",
+  "cluster": "data-model",
+  "english_description": "A read-only view of a node stored inside an owning tree. The view reports local topology facts without changing the owner storage.",
+  "queries": [
+    {
+      "english": "How many child views are visible?",
+      "rust_sig": "fn child_count(&self) -> usize",
+      "pure": true
+    },
+    {
+      "english": "Is this view positioned at a leaf?",
+      "rust_sig": "fn is_leaf(&self) -> bool",
+      "pure": true
+    }
+  ],
+  "commands": [],
+  "constraints": [
+    {
+      "english": "A visible node has at most two children.",
+      "logic": "self.child_count() <= 2",
+      "kind": "invariant",
+      "applies_to": [
+        "child_count",
+        "is_leaf"
+      ]
+    },
+    {
+      "english": "A visible leaf reports zero children.",
+      "logic": "self.is_leaf() == (self.child_count() == 0)",
+      "kind": "invariant",
+      "applies_to": [
+        "is_leaf"
+      ]
+    }
+  ],
+  "adversary_table": [
+    {
+      "scenario": "The owning tree exposes a node view after a third child was attached.",
+      "violates": "self.child_count() <= 2",
+      "resolution": "The owning tree rejects the malformed storage state before exposing the view."
+    }
+  ],
+  "verifier": "creusot"
+}
