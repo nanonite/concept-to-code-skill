@@ -1,0 +1,135 @@
+{
+  "schema_version": "1.0",
+  "concept": "NumericKernel",
+  "cluster": "numeric-kernel",
+  "english_description": "A NumericKernel is a small numeric model with a fixed number of components. It carries a finite set of weights (a normalized distribution over components) and a coupling matrix between component pairs whose off-diagonal entries are non-negative and whose rows sum to zero. From these, the kernel computes a normalized output matrix for a given scale, giving the relative contribution of each component pair after scaling, conditioned on the kernel's weights.",
+  "queries": [
+    {
+      "english": "How many components does the kernel have?",
+      "rust_sig": "fn component_count(&self) -> usize",
+      "pure": true
+    },
+    {
+      "english": "What is the weight of component i?",
+      "rust_sig": "fn weight(&self, index: usize) -> f64",
+      "pure": true
+    },
+    {
+      "english": "What is the coupling from component i to component j?",
+      "rust_sig": "fn coupling(&self, from: usize, to: usize) -> f64",
+      "pure": true
+    },
+    {
+      "english": "Is the kernel symmetric?",
+      "rust_sig": "fn is_symmetric(&self) -> bool",
+      "pure": true
+    },
+    {
+      "english": "Fill the given buffer with normalized outputs for the given scale.",
+      "rust_sig": "fn normalize_into(&self, scale: f64, out: &mut [f64]) -> Result<(), KernelError>",
+      "pure": true
+    }
+  ],
+  "commands": [],
+  "constraints": [
+    {
+      "english": "The component count is finite and at least two.",
+      "logic": "self.component_count() >= 2",
+      "kind": "invariant",
+      "source": "hand"
+    },
+    {
+      "english": "Every weight is a finite value in [0, 1].",
+      "logic": "forall i in 0..self.component_count(): self.weight(i).is_finite() && self.weight(i) >= 0.0 && self.weight(i) <= 1.0",
+      "kind": "invariant",
+      "source": "hand"
+    },
+    {
+      "english": "The weights sum to one within WEIGHT_SUM_TOL.",
+      "logic": "abs(sum(i in 0..self.component_count(): self.weight(i)) - 1.0) <= WEIGHT_SUM_TOL",
+      "kind": "invariant",
+      "source": "daikon"
+    },
+    {
+      "english": "Off-diagonal couplings are finite and non-negative.",
+      "logic": "forall i,j in 0..self.component_count() where i != j: self.coupling(i,j).is_finite() && self.coupling(i,j) >= 0.0",
+      "kind": "invariant",
+      "source": "hand"
+    },
+    {
+      "english": "Each diagonal coupling equals the negation of the row sum of off-diagonal couplings within ROW_SUM_TOL.",
+      "logic": "forall i in 0..self.component_count(): abs(self.coupling(i,i) + sum(j in 0..self.component_count() where j != i: self.coupling(i,j))) <= ROW_SUM_TOL",
+      "kind": "invariant",
+      "source": "daikon"
+    },
+    {
+      "english": "Symmetric kernels satisfy weight-balanced symmetry within BALANCE_TOL.",
+      "logic": "self.is_symmetric() implies forall i,j in 0..self.component_count(): abs(self.weight(i) * self.coupling(i,j) - self.weight(j) * self.coupling(j,i)) <= BALANCE_TOL",
+      "kind": "invariant",
+      "source": "hand"
+    },
+    {
+      "english": "normalize_into returns an error when scale is non-finite or negative.",
+      "logic": "(!scale.is_finite() || scale < 0.0) implies result.is_err()",
+      "kind": "postcondition",
+      "applies_to": "normalize_into",
+      "source": "hand"
+    },
+    {
+      "english": "normalize_into returns an error when the output buffer length is not component_count squared.",
+      "logic": "out.len() != self.component_count() * self.component_count() implies result.is_err()",
+      "kind": "postcondition",
+      "applies_to": "normalize_into",
+      "source": "hand"
+    },
+    {
+      "english": "When normalize_into succeeds, every entry of the output buffer is finite and within [0, 1].",
+      "logic": "result.is_ok() implies forall k in 0..out.len(): out[k].is_finite() && out[k] >= 0.0 && out[k] <= 1.0",
+      "kind": "postcondition",
+      "applies_to": "normalize_into",
+      "source": "hand"
+    },
+    {
+      "english": "When normalize_into succeeds, each row of the output sums to one within ROW_STOCHASTIC_TOL.",
+      "logic": "result.is_ok() implies forall i in 0..self.component_count(): abs(sum(j in 0..self.component_count(): out[i*self.component_count()+j]) - 1.0) <= ROW_STOCHASTIC_TOL",
+      "kind": "postcondition",
+      "applies_to": "normalize_into",
+      "source": "daikon"
+    },
+    {
+      "english": "When normalize_into succeeds with scale equal to zero, the output is the identity matrix within IDENTITY_TOL.",
+      "logic": "result.is_ok() && scale == 0.0 implies forall i,j in 0..self.component_count(): abs(out[i*self.component_count()+j] - (if i == j then 1.0 else 0.0)) <= IDENTITY_TOL",
+      "kind": "postcondition",
+      "applies_to": "normalize_into",
+      "source": "hand"
+    },
+    {
+      "english": "When normalize_into succeeds and the kernel is symmetric, the output satisfies weight-balanced symmetry within OUTPUT_BALANCE_TOL.",
+      "logic": "result.is_ok() && self.is_symmetric() implies forall i,j in 0..self.component_count(): abs(self.weight(i) * out[i*self.component_count()+j] - self.weight(j) * out[j*self.component_count()+i]) <= OUTPUT_BALANCE_TOL",
+      "kind": "postcondition",
+      "applies_to": "normalize_into",
+      "source": "hand"
+    }
+  ],
+  "adversary_table": [
+    {
+      "scenario": "A concrete kernel declares component_count=1 (degenerate single-component case).",
+      "violates": "the component count is at least two",
+      "resolution": "The constructor of any concrete impl rejects with KernelError::InvalidComponentCount { count }."
+    },
+    {
+      "scenario": "Weights contain a NaN or negative value.",
+      "violates": "weight finiteness and range",
+      "resolution": "Construction-time validation rejects with KernelError::InvalidWeights. Query-side weight() must never observe a non-finite value because construction would have failed."
+    },
+    {
+      "scenario": "Caller passes an output buffer of the wrong size.",
+      "violates": "the output buffer size constraint",
+      "resolution": "normalize_into returns KernelError::OutputBufferWrongSize { expected, actual } before touching the buffer."
+    }
+  ],
+  "verifier": "verus",
+  "supplementary_imports": [
+    "crate::kernel_support::KernelError"
+  ]
+}
