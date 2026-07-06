@@ -10,10 +10,6 @@
     "concept",
     "cluster",
     "english_description",
-    "queries",
-    "commands",
-    "constraints",
-    "adversary_table",
     "verifier"
   ],
   "properties": {
@@ -27,10 +23,78 @@
       "pattern": "^[A-Z][A-Za-z0-9]*$",
       "description": "Restricted-English concept name. This is not a Rust type declaration."
     },
+    "kind": {
+      "type": "string",
+      "enum": ["struct", "trait", "enum"],
+      "default": "struct",
+      "description": "How this concept is generated. 'struct' (default) is a concrete pub struct with an inherent impl, matching every concept's behavior before trait/enum concept-kinds were added. 'trait' emits a pub trait with contracts on the bodyless trait method declarations instead of an impl block. 'enum' emits a pub enum wrapping named concrete variants (see 'variants') with a generated per-variant match dispatch for each method declared on the trait named by 'trait_ref' - used to compose a closed, heterogeneous set of concrete concepts without dyn Trait, which some deductive verifiers (e.g. Creusot) cannot reason about."
+    },
     "cluster": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9-]*$",
       "description": "Domain cluster that groups related concepts, such as parsing, data-model, or numeric-kernel."
+    },
+    "implements": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[A-Z][A-Za-z0-9]*$"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["crate", "methods"],
+        "properties": {
+          "crate": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*$",
+            "description": "Crate the trait-kind concept named by this key lives in, resolved under --specs-search-root as <crate>/specs/<snake_case(concept)>.json."
+          },
+          "methods": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string"},
+            "description": "This concept's own query/command names that satisfy the named trait's method declarations. These methods are emitted under 'impl <Trait> for <ThisConcept>' instead of the inherent impl, and do not get their own generated contract attributes - Creusot checks refinement against the trait's own contract automatically. Nothing mechanically verifies these names' signatures actually match the trait's declarations beyond rustc itself at compile time; this is a trusted boundary."
+          }
+        }
+      },
+      "description": "Only meaningful for kind='struct' (the default). Maps a trait-kind concept name to the crate it lives in and the list of this concept's own method names that implement it."
+    },
+    "trait_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["crate", "concept"],
+      "properties": {
+        "crate": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"},
+        "concept": {"type": "string", "pattern": "^[A-Z][A-Za-z0-9]*$"}
+      },
+      "description": "Only meaningful for kind='enum'. Names the trait-kind concept (and its crate) this enum provides variant-dispatched implementations for."
+    },
+    "variants": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "wraps"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Za-z0-9]*$",
+            "description": "The enum variant's name, e.g. 'FastPath'."
+          },
+          "wraps": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["crate", "concept"],
+            "properties": {
+              "crate": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"},
+              "concept": {"type": "string", "pattern": "^[A-Z][A-Za-z0-9]*$"}
+            },
+            "description": "The concrete concept (and its crate) this variant wraps. That concept must declare 'implements' for the trait named by this spec's own trait_ref."
+          }
+        }
+      },
+      "description": "Only meaningful for kind='enum'. Each entry becomes one enum variant wrapping a named concrete concept type."
     },
     "english_description": {
       "type": "string",
@@ -89,9 +153,85 @@
         "minLength": 3
       },
       "description": "Optional list of Rust use-paths to emit at the top of the generated stub module. Use this when a constraint logic expression or a constructor signature references types/constants/functions that live in a sibling support module (e.g. forward-referenced error types, named constants used in invariants, helper predicates like is_nfc). Each entry is the path portion of a `use` statement: e.g. \"crate::string_support::*\" emits `use crate::string_support::*;`."
+    },
+    "kani_f64_checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/kani_f64_check" },
+      "description": "Optional implementation-stage Kani harnesses supplementing a Creusot-primary concept when f64 sign or finiteness obligations cannot be expressed in Creusot logic (check whether the Creusot toolchain in use has closed this gap before reaching for this escape hatch). Presence generates tests/kani_f64_<concept>.rs."
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "not": {
+          "properties": {"kind": {"const": "enum"}},
+          "required": ["kind"]
+        }
+      },
+      "then": {
+        "required": ["queries", "commands", "constraints", "adversary_table"],
+        "description": "kind='struct' (the default, when 'kind' is absent) and kind='trait' both need the full query/command/constraint/adversary_table set, exactly as every concept did before trait/enum concept-kinds were added."
+      }
+    },
+    {
+      "if": {
+        "properties": {"kind": {"const": "enum"}},
+        "required": ["kind"]
+      },
+      "then": {
+        "required": ["trait_ref", "variants"],
+        "description": "kind='enum' has no queries/commands/constraints/adversary_table of its own - the generator resolves trait_ref cross-crate for the method list to dispatch, and variants for which concrete types to wrap."
+      }
+    }
+  ],
   "$defs": {
+    "kani_f64_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "symbolic_f64s", "assumptions", "statements", "expected"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "description": "Stable suffix for the generated Kani harness name."
+        },
+        "imports": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 3},
+          "description": "Rust use-paths required by this integration-test harness."
+        },
+        "symbolic_f64s": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[a-z_][A-Za-z0-9_]*$"},
+          "description": "Names emitted as symbolic f64 values from kani::any()."
+        },
+        "assumptions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1},
+          "description": "Plain Rust boolean expressions emitted as kani::assume calls."
+        },
+        "statements": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1},
+          "description": "Rust setup and call statements executed by the harness."
+        },
+        "assertions": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "description": "Plain Rust boolean expressions emitted as assert! calls."
+        },
+        "expected": {
+          "type": "string",
+          "enum": ["pass", "panic"],
+          "description": "Whether every admitted execution must complete normally or reach a panic."
+        }
+      }
+    },
     "query": {
       "type": "object",
       "additionalProperties": false,

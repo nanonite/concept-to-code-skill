@@ -16,6 +16,19 @@ Goal: produce one JSON concept artifact that conforms to
    constraints, and adversary table are complete, do not use these Rust
    declaration words: `struct`, `enum`, `trait`, `fn`, `impl`, `generic`.
 2. Identify the concept and cluster.
+2a. **Optional: concept kind.** Most concepts are `kind: "struct"` (the
+    default, no field needed) -- one concrete behavior, one concrete struct.
+    If the concept under analysis genuinely describes a *shared interface*
+    that several concrete concepts satisfy (not just "this concept has
+    several cases"), consider `kind: "trait"` for the interface and
+    `kind: "enum"` for the concrete composition of a closed, heterogeneous
+    set of implementors -- the standard way to avoid `dyn Trait` for
+    verifiers that can't reason about it (e.g. Creusot). This is a legitimate
+    Step A decision, not a Rust-vocabulary violation of rule 1 above (`kind`
+    is a schema field, not prose) -- but don't reach for it by default; most
+    concepts should stay `kind: "struct"`. See SKILL.md's "Concept kinds"
+    section and `tests/fixtures/trait_enum_demo/` for the schema shape
+    (`implements`, `trait_ref`, `variants`) and a worked example.
 3. Write the concept's `english_description` without implementation
    vocabulary.
 4. Write queries as pure observations. Each query needs `english`,

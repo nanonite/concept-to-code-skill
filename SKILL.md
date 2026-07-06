@@ -30,10 +30,17 @@ A consuming project provides or configures:
   scaffolds into.
 - `--contracts-crate <name>` (default `contracts`): the verifier-contracts
   facade crate. It must expose `<name>::creusot::*` (Pearlite contract
-  attributes plus `creusot_f64_*` model-predicate helpers and a
-  `creusot::prelude` re-export) and `<name>::verus::prelude::*` (the Verus
-  prelude). See `tests/fixtures/contracts-crate/` for a minimal example
+  attributes plus `creusot_f64_*` model-predicate helpers, `logic`/`trusted`
+  attribute macros and a `pearlite!` macro for query logic-model companions,
+  and a `creusot::prelude` re-export) and `<name>::verus::prelude::*` (the
+  Verus prelude). See `tests/fixtures/contracts-crate/` for a minimal example
   satisfying this shape.
+- `--specs-search-root <path>` (default: the parent of `--crate-dir`): root
+  directory searched for another crate's spec JSON when resolving a
+  `kind: "struct"` concept's `implements` or a `kind: "enum"` concept's
+  `trait_ref`/`variants`, as `<root>/<crate>/specs/<snake_case(concept)>.json`.
+  Only matters for concepts using those fields; a single-crate invocation
+  with none is unaffected.
 - A findings-report path convention (project-defined). One example
   convention: `findings/<crate>/<concept-kebab>.md`.
 - An optional trace-sidecar path for trace-inferred invariants (project-
@@ -43,6 +50,37 @@ A consuming project provides or configures:
   replace it as long as the `$defs` shape (query/command/constraint/
   adversary_case/source_reference) is preserved, since `emit_stubs.py`
   depends on that shape.
+
+## Concept kinds
+
+Most concepts are `kind: "struct"` (the default): a concrete `pub struct`
+with an inherent impl. Two more kinds exist for composing concepts without
+`dyn Trait`, which some deductive verifiers (e.g. Creusot) cannot reason
+about:
+
+- `kind: "trait"` emits a `pub trait` with contracts on its bodyless method
+  declarations. A `kind: "struct"` concept's `implements` field routes named
+  methods into `impl Trait for Concept` instead of the inherent impl, with no
+  restated contract attributes (the verifier checks refinement against the
+  trait's own declaration).
+- `kind: "enum"` emits a closed `pub enum` wrapping named concrete concepts
+  (`variants`), with one match-dispatched method per method declared on the
+  trait named by `trait_ref`.
+
+Both `implements` and `trait_ref`/`variants` reference another concept's spec
+JSON by crate name, resolved under `--specs-search-root`. See
+`tests/fixtures/trait_enum_demo/` for a worked example (a `Toggle` trait, two
+concrete implementors, and an `AnyToggle` enum composing them).
+
+## Supplementary Kani f64 checks
+
+A Creusot-primary concept (`verifier: "creusot"`) may include
+`kani_f64_checks`: implementation-stage Kani harnesses supplementing Pearlite
+contracts when an f64 sign or finiteness obligation can't be expressed in
+Creusot logic (check whether the Creusot toolchain in use has closed this gap
+before reaching for it). Presence generates `tests/kani_f64_<concept>.rs` via
+`--kani-f64-out` (default path from `default_paths`). See
+`tests/fixtures/kani_f64_demo.json` for a worked example.
 
 ## Hard Rules
 
@@ -75,6 +113,9 @@ A consuming project provides or configures:
 - `emit_stubs.py`: deterministic JSON-to-Rust stub generator.
 - `schemas/spec.schema.json`: bundled generic concept schema.
 - `docs/spec-first-workflow.md`: the 6-step workflow this skill follows.
+- `tests/fixtures/trait_enum_demo/`: worked `kind: "trait"`/`kind: "enum"`/
+  `implements` example.
+- `tests/fixtures/kani_f64_demo.json`: worked `kani_f64_checks` example.
 
 ## Recommended Flow
 

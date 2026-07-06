@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "concept": "AnyToggle",
+  "kind": "enum",
+  "cluster": "demo-toggle",
+  "english_description": "A closed set of toggle implementations composed without dyn Trait, dispatching each Toggle method to whichever concrete toggle variant is active.",
+  "verifier": "creusot",
+  "trait_ref": {"crate": "democrate", "concept": "Toggle"},
+  "variants": [
+    {"name": "Fast", "wraps": {"crate": "democrate", "concept": "FastToggle"}},
+    {"name": "Slow", "wraps": {"crate": "democrate", "concept": "SlowToggle"}}
+  ]
+}

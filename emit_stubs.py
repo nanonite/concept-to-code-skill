@@ -32,6 +32,12 @@ NOT_VERUS_CFG = '#[cfg(not(any(verus, feature = "verus")))]'
 CONTRACTS_CREUSOT = "contracts::creusot"
 CONTRACTS_VERUS_PRELUDE = "contracts::verus::prelude"
 
+# Root directory searched for another crate's spec JSON when resolving
+# `implements`/`trait_ref`/`variants` cross-crate references. Overridden in
+# main() from --specs-search-root; defaults to the parent of --crate-dir so
+# a single-crate invocation with no cross-crate references is unaffected.
+SPECS_SEARCH_ROOT = Path(".")
+
 
 class SpecError(ValueError):
     pass
@@ -83,7 +89,51 @@ def returns_unit(signature: str) -> bool:
     return ret == "" or ret == "-> ()"
 
 
+def concept_kind(spec: dict[str, Any]) -> str:
+    kind = spec.get("kind", "struct")
+    if kind not in {"struct", "trait", "enum"}:
+        raise SpecError(f"kind must be one of: struct, trait, enum (got {kind!r})")
+    return kind
+
+
+def validate_enum_spec(spec: dict[str, Any]) -> list[Method]:
+    """Lighter validation for kind='enum'. No queries/commands of its own --
+    methods to dispatch come from resolving trait_ref."""
+    required = ["schema_version", "concept", "cluster", "english_description", "verifier", "trait_ref", "variants"]
+    missing = [key for key in required if key not in spec]
+    if missing:
+        raise SpecError(f"missing required fields for kind=enum: {', '.join(missing)}")
+    if spec["schema_version"] != "1.0":
+        raise SpecError("schema_version must be '1.0'")
+    if not re.match(r"^[A-Z][A-Za-z0-9]*$", spec["concept"]):
+        raise SpecError("concept must match ^[A-Z][A-Za-z0-9]*$")
+    if spec["verifier"] not in {"kani", "creusot", "verus"}:
+        raise SpecError("verifier must be one of: kani, creusot, verus")
+    trait_ref = spec["trait_ref"]
+    if "crate" not in trait_ref or "concept" not in trait_ref:
+        raise SpecError("trait_ref requires 'crate' and 'concept'")
+    variants = spec.get("variants") or []
+    if not variants:
+        raise SpecError("variants must be present and non-empty for kind=enum")
+    seen_names: set[str] = set()
+    for variant in variants:
+        name = variant.get("name", "")
+        if not re.match(r"^[A-Z][A-Za-z0-9]*$", name):
+            raise SpecError(f"variant name must match ^[A-Z][A-Za-z0-9]*$: {name!r}")
+        if name in seen_names:
+            raise SpecError(f"duplicate variant name: {name}")
+        seen_names.add(name)
+        wraps = variant.get("wraps", {})
+        if "crate" not in wraps or "concept" not in wraps:
+            raise SpecError(f"variant {name!r} 'wraps' requires 'crate' and 'concept'")
+    return []
+
+
 def validate_spec(spec: dict[str, Any]) -> list[Method]:
+    kind = concept_kind(spec)
+    if kind == "enum":
+        return validate_enum_spec(spec)
+
     required = [
         "schema_version",
         "concept",
@@ -106,6 +156,29 @@ def validate_spec(spec: dict[str, Any]) -> list[Method]:
         raise SpecError("verifier must be one of: kani, creusot, verus")
     if not spec.get("adversary_table"):
         raise SpecError("adversary_table must be present and non-empty")
+    checks = spec.get("kani_f64_checks", [])
+    if checks and spec["verifier"] != "creusot":
+        raise SpecError("kani_f64_checks are only valid for creusot-primary concepts")
+    check_names: set[str] = set()
+    for check in checks:
+        name = check.get("name", "")
+        if not re.match(r"^[a-z][a-z0-9_]*$", name):
+            raise SpecError(f"invalid kani_f64_checks name: {name!r}")
+        if name in check_names:
+            raise SpecError(f"duplicate kani_f64_checks name: {name}")
+        check_names.add(name)
+        symbolic_f64s = check.get("symbolic_f64s", [])
+        if not symbolic_f64s:
+            raise SpecError(f"kani_f64_checks {name!r} requires symbolic_f64s")
+        if len(symbolic_f64s) != len(set(symbolic_f64s)):
+            raise SpecError(f"kani_f64_checks {name!r} has duplicate symbolic_f64s")
+        if any(not IDENT_RE.match(symbol) for symbol in symbolic_f64s):
+            raise SpecError(f"kani_f64_checks {name!r} has an invalid symbolic f64 name")
+        for required_list in ("assumptions", "statements"):
+            if not check.get(required_list):
+                raise SpecError(f"kani_f64_checks {name!r} requires {required_list}")
+        if check.get("expected") not in {"pass", "panic"}:
+            raise SpecError(f"kani_f64_checks {name!r} expected must be pass or panic")
 
     methods: list[Method] = []
     for query in spec.get("queries", []):
@@ -126,7 +199,37 @@ def validate_spec(spec: dict[str, Any]) -> list[Method]:
 
     if not methods:
         raise SpecError("at least one query or command is required")
+
+    method_names = {m.name for m in methods}
+    for trait_name, trait_info in spec.get("implements", {}).items():
+        if "crate" not in trait_info or "methods" not in trait_info:
+            raise SpecError(f"implements[{trait_name!r}] requires 'crate' and 'methods'")
+        unknown = [name for name in trait_info["methods"] if name not in method_names]
+        if unknown:
+            raise SpecError(
+                f"implements[{trait_name!r}].methods names methods not in this "
+                f"concept's own queries/commands: {unknown}"
+            )
     return methods
+
+
+def resolve_cross_crate_spec(crate: str, concept: str) -> dict[str, Any]:
+    """Load another crate's concept JSON by convention.
+
+    Used by `implements`/`trait_ref`/`variants` references, which are the
+    first things in this generator that need to read a spec file other than
+    the one passed on the command line. Path convention: `<specs-search-root>/
+    <crate>/specs/<snake_case(concept)>.json`, where `--specs-search-root`
+    defaults to the parent of `--crate-dir` (see SPECS_SEARCH_ROOT/main()) --
+    so a single-crate invocation with no cross-crate references is unaffected.
+    A missing file is a hard error, never a silent skip.
+    """
+    path = SPECS_SEARCH_ROOT / crate / "specs" / f"{snake_case(concept)}.json"
+    if not path.exists():
+        raise SpecError(
+            f"cross-crate spec not found: {path} (referenced as {crate}::{concept})"
+        )
+    return json.loads(path.read_text())
 
 
 def constraint_applies_to(constraint: dict[str, Any]) -> list[str]:
@@ -381,6 +484,91 @@ def _replace_products(expr: str, quantified: list[str], query_spec_map: dict[str
         out = f"{out[:start]}{replacement}{out[close_index + 1:]}"
 
 
+_TRIGGER_RECEIVER_CALL_RE = re.compile(r"(?:final\(self\)|old\(self\)|self|result)(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
+_TRIGGER_IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+_TRIGGER_HELPER_CALL_RE = re.compile(
+    r"\b(?:verus_sum_f64_where|verus_sum_f64|verus_product_f64_where|verus_product_f64|abs_f64|verus_f64_is_finite)\b"
+)
+
+
+def _extract_trigger_candidates(text: str) -> list[str]:
+    """Find subterms of `text` that could serve as Verus quantifier triggers.
+
+    Candidates are receiver method calls (`self.foo_spec(...)`,
+    `result.foo_spec(...)`, `final(self).foo_spec(...)`,
+    `old(self).foo_spec(...)`), array/slice indexing (`name[...]`,
+    including chained `name[...][...]`), and calls to the generated
+    spec-helper functions (`verus_sum_f64`, `verus_sum_f64_where`,
+    `verus_product_f64`, `verus_product_f64_where`, `abs_f64`,
+    `verus_f64_is_finite`). These are the "open spec fn" and index shapes
+    that appear in generated bounded-forall bodies. Helper-call candidates
+    are appended last so receiver/index candidates are preferred when both
+    cover the required variables.
+    """
+    candidates: list[str] = []
+    for match in _TRIGGER_RECEIVER_CALL_RE.finditer(text):
+        end = match.end()
+        if end < len(text) and text[end] == "(":
+            close = _find_matching(text, end, "(", ")")
+            candidates.append(text[match.start() : close + 1])
+    for match in _TRIGGER_IDENT_RE.finditer(text):
+        end = match.end()
+        if end >= len(text) or text[end] != "[":
+            continue
+        close = _find_matching(text, end, "[", "]")
+        while close + 1 < len(text) and text[close + 1] == "[":
+            close = _find_matching(text, close + 1, "[", "]")
+        candidates.append(text[match.start() : close + 1])
+    for match in _TRIGGER_HELPER_CALL_RE.finditer(text):
+        end = match.end()
+        if end < len(text) and text[end] == "(":
+            close = _find_matching(text, end, "(", ")")
+            candidate = text[match.start() : close + 1]
+            # Verus rejects `#![trigger ...]` terms containing a closure
+            # (e.g. `verus_sum_f64(0, n, |j: int| ...)`) with
+            # "the argument to `closure_to_fn` must be a closure". Skip any
+            # helper-call candidate whose argument list still contains one.
+            if "|" not in candidate:
+                candidates.append(candidate)
+    return candidates
+
+
+def _select_trigger_terms(body: str, vars_: list[str]) -> list[str] | None:
+    """Pick Verus `#![trigger ...]` terms for a bounded forall over `vars_`.
+
+    Only the part of `body` before any nested `forall` is searched: a
+    nested forall's own trigger covers its bound variables, and a term
+    that mentions a deeper-bound variable is not a valid trigger for this
+    (outer) quantifier. Returns `None` when no candidate mentions every
+    variable in `vars_` (single term) or when no pair of candidates
+    jointly covers `vars_` (multi-trigger).
+    """
+    nested_forall = re.search(r"\bforall\b", body)
+    source = body[: nested_forall.start()] if nested_forall else body
+    if not source.strip():
+        return None
+    candidates = _extract_trigger_candidates(source)
+    var_patterns = {var: re.compile(rf"\b{re.escape(var)}\b") for var in vars_}
+
+    def covers(span: str) -> set[str]:
+        return {var for var, pattern in var_patterns.items() if pattern.search(span)}
+
+    full = set(vars_)
+    for span in candidates:
+        if covers(span) == full:
+            return [span]
+    if len(vars_) > 1:
+        for i, first in enumerate(candidates):
+            first_cover = covers(first)
+            if not first_cover or first_cover == full:
+                continue
+            for second in candidates[i + 1 :]:
+                second_cover = covers(second)
+                if first_cover | second_cover == full and first_cover != second_cover:
+                    return [first, second]
+    return None
+
+
 def _replace_foralls(expr: str, quantified: list[str], query_spec_map: dict[str, str] | None = None) -> str:
     match = re.search(r"\bforall\b", expr)
     if not match:
@@ -388,23 +576,49 @@ def _replace_foralls(expr: str, quantified: list[str], query_spec_map: dict[str,
     prefix = expr[: match.start()]
     clause = expr[match.end() :].strip()
     vars_, end_expr, guard, body = _parse_range_clause(clause)
-    nested_quantified = quantified + vars_
+
+    # Flatten immediately-nested foralls with mutually independent bounds
+    # (`forall a in 0..A: forall b in 0..B: BODY`) into a single multi-variable
+    # forall (`forall|a, b| (bounds_a) && (bounds_b) ==> BODY`). This gives
+    # `_select_trigger_terms` a body with no remaining nested `forall`, so a
+    # single term mentioning all bound variables (e.g. `arr[a * B + b]`) can
+    # serve as the trigger for the whole quantifier. Without flattening, Verus
+    # cannot infer a trigger for an outer quantifier whose entire body is
+    # another quantifier.
+    all_vars = list(vars_)
+    bound_groups: list[tuple[list[str], str, str | None]] = [(vars_, end_expr, guard)]
+    while True:
+        stripped = body.lstrip()
+        if not stripped.startswith("forall"):
+            break
+        inner_clause = stripped[len("forall") :].strip()
+        try:
+            inner_vars, inner_end_expr, inner_guard, inner_body = _parse_range_clause(inner_clause)
+        except SpecError:
+            break
+        bound_var_pattern = re.compile(r"\b(?:" + "|".join(re.escape(v) for v in all_vars) + r")\b")
+        if bound_var_pattern.search(inner_end_expr) or (inner_guard and bound_var_pattern.search(inner_guard)):
+            break
+        all_vars.extend(inner_vars)
+        bound_groups.append((inner_vars, inner_end_expr, inner_guard))
+        body = inner_body
+
+    nested_quantified = quantified + all_vars
     bounds: list[str] = []
-    if len(vars_) == 1:
-        var = vars_[0]
-        bounds = [f"0 <= {var}", f"{var} < ({end_expr}) as int"]
-    if len(vars_) > 1:
-        for var in vars_:
-            bounds.extend([f"0 <= {var}", f"{var} < ({end_expr}) as int"])
-    if guard:
-        bounds.append(_cast_quantified_refs(
-            _translate_verus_expr(guard, nested_quantified, query_spec_map=query_spec_map),
-            nested_quantified,
-            query_spec_map,
-        ))
+    for group_vars, group_end_expr, group_guard in bound_groups:
+        for var in group_vars:
+            bounds.extend([f"0 <= {var}", f"{var} < ({group_end_expr}) as int"])
+        if group_guard:
+            bounds.append(_cast_quantified_refs(
+                _translate_verus_expr(group_guard, nested_quantified, query_spec_map=query_spec_map),
+                nested_quantified,
+                query_spec_map,
+            ))
     translated_body = _translate_verus_expr(body, nested_quantified, query_spec_map=query_spec_map)
-    params = ", ".join(f"{var}: int" for var in vars_)
-    replacement = f"forall|{params}| {' && '.join(bounds)} ==> {translated_body}"
+    params = ", ".join(f"{var}: int" for var in all_vars)
+    triggers = _select_trigger_terms(translated_body, all_vars)
+    trigger_clause = f" #![trigger {', '.join(triggers)}]" if triggers else ""
+    replacement = f"forall|{params}|{trigger_clause} {' && '.join(bounds)} ==> {translated_body}"
     return f"{prefix}{replacement}"
 
 
@@ -546,6 +760,13 @@ CREUSOT_SCOPE_RESERVED = {
     "f64",
     "bool",
     "_",
+    # Restricted-English quantifier syntax (#458): the scope check runs on
+    # `creusot_raw` before `_replace_creusot_forall` strips this syntax, so
+    # these keywords must not be mistaken for free variable names.
+    "forall",
+    "exists",
+    "in",
+    "where",
 }
 
 CREUSOT_IGNORED_CALLS = {
@@ -588,6 +809,37 @@ def method_arg_names(method: Method) -> set[str]:
     return names
 
 
+def _creusot_usize_param_names(method: Method) -> frozenset[str]:
+    """Return the set of parameter names that have plain usize type.
+
+    Used to distinguish bare `index@ <` (plain usize) from `index.0@ <`
+    (newtype wrappers) in Pearlite constraints.
+    """
+    _name, args, _ret = method_signature_parts(method.rust_sig)
+    if not args:
+        return frozenset()
+    names: set[str] = set()
+    for raw_arg in args.split(","):
+        arg = raw_arg.strip()
+        if ":" not in arg:
+            continue
+        name_part, type_part = arg.split(":", 1)
+        name = name_part.strip().removeprefix("mut ").strip().removeprefix("&mut ").strip().removeprefix("&").strip()
+        if type_part.strip() == "usize" and name:
+            names.add(name)
+    return frozenset(names)
+
+
+def _creusot_domain_index_param_names(method: Method) -> frozenset[str]:
+    """Return parameters whose newtype names end in `Index`."""
+    _name, args, _ret = method_signature_parts(method.rust_sig)
+    return frozenset(
+        name
+        for name, ty in parse_arg_types(args).items()
+        if ty.rsplit("::", 1)[-1].endswith("Index")
+    )
+
+
 def creusot_free_identifiers(logic: str) -> set[str]:
     free: set[str] = set()
     for match in re.finditer(r"\b[A-Za-z_]\w*\b", logic):
@@ -606,14 +858,45 @@ def creusot_free_identifiers(logic: str) -> set[str]:
     return free
 
 
+def creusot_quantifier_bound_vars(logic: str) -> set[str]:
+    """Collect variable names bound by `forall`/`exists` headers in `logic` (#458).
+
+    Runs on the restricted-English form, before `_replace_creusot_forall`
+    converts headers to Pearlite, so it parses the same `<vars> in 0..<end>`
+    / bare `<vars>` head shape as `_parse_range_clause` without requiring a
+    range to be present (`forall label: ...` has none). Each `forall`/`exists`
+    occurrence (including nested ones) is scanned independently since only
+    the union of bound names is needed here, not proper lexical nesting.
+    """
+    bound: set[str] = set()
+    for match in re.finditer(r"\b(?:forall|exists)\b", logic):
+        rest = logic[match.end() :]
+        colon = _find_top_level(rest, ":")
+        if colon < 0:
+            continue
+        head = rest[:colon].strip()
+        where_idx = _find_top_level(head, " where ")
+        if where_idx >= 0:
+            head = head[:where_idx].strip()
+        vars_part = head.split(" in 0..", 1)[0] if " in 0.." in head else head
+        for var in vars_part.split(","):
+            var = var.strip()
+            if re.fullmatch(r"[A-Za-z_]\w*", var):
+                bound.add(var)
+    return bound
+
+
 def creusot_constraint_in_scope(logic: str, method: Method) -> bool:
     scope = method_arg_names(method)
     if method_has_self(method):
         scope.add("self")
-    if method_returns_result(method):
+    if method_returns_result(method) or not method_has_self(method):
+        # rewrite_static_self_for_creusot rewrites `self.` -> `result.` for
+        # every self-less method, not just Result-returning ones.
         scope.add("result")
-    for binder in re.findall(r"\bOk\((\w+)\)", logic):
+    for binder in re.findall(r"\b(?:Ok|Some)\((\w+)\)", logic):
         scope.add(binder)
+    scope |= creusot_quantifier_bound_vars(logic)
     missing = creusot_free_identifiers(logic) - scope
     return not missing
 
@@ -687,22 +970,211 @@ def rewrite_result_methods_for_creusot(logic: str, method: Method) -> str:
     return f"match result {{ Ok(ok_result) => {rewritten}, Err(_) => true }}"
 
 
-def rewrite_logic_for_creusot(logic: str, method: Method) -> str:
+def _rewrite_mut_self_prophecy_for_creusot(logic: str) -> str:
+    """Rewrite &mut self postcondition to Pearlite prophecy notation (#348).
+
+    For fn method(&mut self) ensures clauses, Creusot represents the pre-call
+    receiver as *self and the post-call receiver as ^self.  old(self.X(args))
+    maps to (*self).X(args); bare self.X(args) maps to (^self).X(args).
+
+    The old() rewrite matches the full old(self.X(args)) including its closing )
+    so no dangling paren is left in the output.  args must have no nested parens
+    (sufficient for constraints seen so far).
+    """
+    # Step 1: old(self.X(args)) -> (*self).X(args)   [pre-state deref]
+    logic = re.sub(r"\bold\(self\.(\w+\([^()]*\))\)", r"(*self).\1", logic)
+    # Step 2: remaining self.X(args) -> (^self).X(args)   [prophecy / post-state]
+    logic = re.sub(r"\bself\.(\w+\([^()]*\))", r"(^self).\1", logic)
+    return logic
+
+
+def rewrite_logic_for_creusot(logic: str, method: Method, methods: list[Method]) -> str:
     logic = rewrite_static_self_for_creusot(logic, method)
+    logic = rewrite_string_view_mismatches_for_creusot(logic, method, methods)
     logic = rewrite_result_methods_for_creusot(logic, method)
     return logic
 
 
-def creusot_needs_query_model(logic: str) -> bool:
-    receivers = [
-        r"\bself",
-        r"\bok_result",
-        r"\bresult\.as_ref\(\)\.unwrap\(\)",
-    ]
-    for receiver in receivers:
-        if re.search(receiver + r"\.\w+\(", logic):
+CREUSOT_INT_RETURN_TYPES = {
+    "usize", "u64", "u32", "u16", "u8", "i64", "i32", "isize", "i16", "i8",
+}
+
+
+def creusot_logic_type(ret_ty: str) -> str | None:
+    """Creusot logic type for a query return type, or None if not yet modelable.
+
+    Integer returns map to the mathematical `Int`; `bool` maps to `bool`.
+    Reference/Option/string returns (`&str`, `&T`, `Option<_>` other than
+    `Option<f64>`) have no logic model yet (sequence/string models are
+    follow-on work), so they return None and their constraints keep a
+    targeted sentinel.
+    """
+    stripped = ret_ty.strip().removeprefix("->").strip()
+    if stripped in CREUSOT_INT_RETURN_TYPES:
+        return "Int"
+    if stripped == "bool":
+        return "bool"
+    if stripped == "f64":
+        return "f64"
+    if stripped == "Option<f64>":
+        return "Option<f64>"
+    return None
+
+
+def creusot_query_model_companions(methods: list[Method]) -> dict[str, str]:
+    """Map modelable queries to a `<name>_model` logic companion."""
+    companions: dict[str, str] = {}
+    for method in methods:
+        if method.kind != "query":
+            continue
+        name, args, ret_ty = method_signature_parts(method.rust_sig)
+        if "&mut" in args:
+            continue
+        if creusot_logic_type(ret_ty) is None:
+            continue
+        companions[name] = f"{name}_model"
+    return companions
+
+
+def _creusot_model_args(args: str) -> str:
+    """Query args with the receiver taken by value (`self`) for the logic model."""
+    stripped = args.strip()
+    if stripped.startswith("&self"):
+        stripped = "self" + stripped[len("&self"):]
+    # Logic-model indices inhabit Pearlite's mathematical integer domain. This
+    # lets quantified Int binders call the companion without an impossible
+    # conversion back to an executable usize/domain index.
+    return re.sub(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:usize|[A-Za-z_][A-Za-z0-9_]*Index)\b",
+        r"\1: Int",
+        stripped,
+    )
+
+
+def emit_creusot_query_model_companion(
+    lines: list[str], method: Method, model_name: str, *, pub: bool = True
+) -> None:
+    """Emit a trusted opaque Pearlite logic model for a query method so contracts
+    can reference `self.<query>_model()` instead of the program method, which
+    Creusot rejects in logic context.
+
+    The body is a fixed placeholder value keyed only by the query's return
+    type (`defaults` below) -- it never reads concrete fields, so it is
+    equally valid as a default-bodied trait method (`pub=False`, kind='trait')
+    inherited by every implementor, not just an inherent impl method on one
+    concrete type."""
+    _name, args, ret_ty = method_signature_parts(method.rust_sig)
+    logic_ty = creusot_logic_type(ret_ty)
+    if logic_ty is None:
+        raise SpecError(f"unsupported Creusot logic model return type: {ret_ty}")
+    defaults = {"Int": "0", "bool": "true", "f64": "0.0f64", "Option<f64>": "None"}
+    default = defaults[logic_ty]
+    qualifier = "pub " if pub else ""
+    lines.append("    #[cfg(creusot)]")
+    lines.append("    #[trusted]")
+    lines.append("    #[logic(opaque)]")
+    lines.append(
+        f"    {qualifier}fn {model_name}({_creusot_model_args(args)}) -> {logic_ty} {{ pearlite! {{ {default} }} }}"
+    )
+
+
+def creusot_logic_unmodeled(rerouted: str, model_names: set[str]) -> bool:
+    """Return True when rerouted logic still calls non-logic program methods.
+
+    Modelable queries are replaced with emitted `*_model` logic functions before
+    this check. Creusot f64 helper calls are trusted logic functions too, so they
+    are allowed here. Any remaining `.<m>(` call is treated as a program method
+    and keeps a targeted sentinel. old()/final() on &mut self ensures are
+    rewritten to (*self).X()/(^self).X() by _rewrite_mut_self_prophecy_for_creusot
+    before this check (#348); remaining old()/final() in other positions still
+    sentinel. This replaces the older, coarser creusot_needs_query_model."""
+    if re.search(r"\b(old|final)\(", rerouted):
+        return True
+    helper_names = CREUSOT_IGNORED_CALLS | model_names
+    for match in re.finditer(r"(?<!::)\.(\w+)\(", rerouted):
+        if match.group(1) not in helper_names:
             return True
     return False
+
+
+def creusot_chain_model_companions(
+    methods: list[Method], spec: dict[str, Any]
+) -> dict[tuple[str, str], str]:
+    """Map a chained Int-terminal call `self.<q>(args).<term>()` -- where <q> is a
+    query and <term> is in CREUSOT_USIZE_MODEL_CALLS (len/size/...) -- to a
+    `<q>_<term>_model` logic companion returning Int. Covers reference-returning
+    queries and string `.len()` that the per-query integer models alone cannot
+    reach. See #349."""
+    query_names = {m.name for m in methods if m.kind == "query"}
+    out: dict[tuple[str, str], str] = {}
+    for constraint in spec.get("constraints", []):
+        for mt in re.finditer(r"\bself\.(\w+)\([^()]*\)\.(\w+)\(\)", constraint.get("logic", "")):
+            q, term = mt.group(1), mt.group(2)
+            if q in query_names and term in CREUSOT_USIZE_MODEL_CALLS:
+                out[(q, term)] = f"{q}_{term}_model"
+    return out
+
+
+def emit_creusot_chain_model_companion(
+    lines: list[str], method: Method, model_name: str, *, pub: bool = True
+) -> None:
+    """Emit an Int logic model for a chained `self.<q>(args).<term>()` call (#349).
+
+    Same trusted/opaque, field-independent shape as
+    `emit_creusot_query_model_companion` -- see its docstring for why
+    `pub=False` (default trait method, kind='trait') is valid."""
+    _name, args, _ret = method_signature_parts(method.rust_sig)
+    model_args = _creusot_model_args(args)
+    # Quantifier binders are Pearlite Int values.  Chained terminal models are
+    # logical projections, not calls to the program query, so index arguments
+    # must use the same logical domain.  Keeping usize or a domain newtype here
+    # makes every `forall<i: Int> ... model(i)` ill-typed.
+    model_args = re.sub(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:usize|[A-Za-z_][A-Za-z0-9_]*Index)\b",
+        r"\1: Int",
+        model_args,
+    )
+    qualifier = "pub " if pub else ""
+    lines.append("    #[cfg(creusot)]")
+    lines.append("    #[trusted]")
+    lines.append("    #[logic(opaque)]")
+    lines.append(
+        f"    {qualifier}fn {model_name}({model_args}) -> Int {{ pearlite! {{ 0 }} }}"
+    )
+
+
+def _replace_chain_calls(expr: str, chain_map: dict[tuple[str, str], str]) -> str:
+    """Rewrite `self.<q>(args).<term>()` -> `self.<q>_<term>_model(args)` (#349)."""
+    out = expr
+    for (q, term), model_name in sorted(
+        chain_map.items(), key=lambda kv: len(kv[0][0]), reverse=True
+    ):
+        out = re.sub(
+            rf"\b(self|result|old\(self\)|final\(self\))\.{re.escape(q)}\(([^()]*)\)\.{re.escape(term)}\(\)",
+            rf"\1.{model_name}(\2)",
+            out,
+        )
+    return out
+
+
+def _replace_creusot_option_f64_equalities(src: str, names: set[str]) -> str:
+    """Route equality between known Option<f64> values through the facade."""
+    if not names:
+        return src
+    atom = r"(?:self|old\(self\)|final\(self\)|result)\.[A-Za-z_]\w*\(\)|[A-Za-z_]\w*"
+
+    def is_option(expr: str) -> bool:
+        terminal = re.search(r"([A-Za-z_]\w*)(?:\(\))?$", expr)
+        return terminal is not None and terminal.group(1) in names
+
+    def repl(match: re.Match[str]) -> str:
+        left, op, right = match.group(1), match.group(2), match.group(3)
+        if not (is_option(left) and is_option(right)):
+            return match.group(0)
+        call = f"{CONTRACTS_CREUSOT}::creusot_option_f64_eq({left}, {right})"
+        return f"!{call}" if op == "!=" else call
+
+    return re.sub(rf"(?<![\w.])({atom})\s*(==|!=)\s*({atom})", repl, src)
 
 
 def translate_logic_to_creusot(logic: str) -> str:
@@ -735,6 +1207,96 @@ def rewrite_static_self_for_creusot(logic: str, method: Method) -> str:
         rewritten = re.sub(r"\bself\.", "result.as_ref().unwrap().", logic)
         return f"result.is_ok() ==> {rewritten}"
     return re.sub(r"\bself\.", "result.", logic)
+
+
+def translate_logic_to_kani(logic: str) -> str:
+    """Translate restricted-English `logic` to plain Rust bool for kani::requires/ensures.
+
+    Kani attribute macros take standard Rust boolean expressions -- no
+    implication operator, no quantifiers. Unsupported forms degrade to a
+    true-sentinel so contract emission can proceed without a working
+    quantifier model.
+    """
+    src = logic.strip()
+    if not src:
+        return src
+    # forall/exists/sum: no Kani attr-level equivalent; sentinel.
+    if re.search(r"\bforall\b|\bexists\b|\bsum\b", src):
+        return "true /* TODO(concept-to-code): quantifier unsupported in kani::requires/ensures */"
+    # ==>: rewrite material implication a ==> b as !(a) || (b).
+    # _find_top_level respects parenthesis nesting so complex lhs/rhs are handled.
+    top = _find_top_level(src, "==>")
+    if top >= 0:
+        lhs = src[:top].strip()
+        rhs = src[top + 3:].strip()
+        return f"!({lhs}) || ({rhs})"
+    return src
+
+
+def rewrite_static_self_for_kani(logic: str, method: Method) -> str:
+    """For self-less constructors, rewrite self -> result inside kani::ensures closures.
+
+    Handles both `self.foo()` (method-call form) and bare `self` (deref form, e.g. `== *self`).
+    The dot-terminated sub runs first so `self.` is consumed before the bare-`self` sub fires.
+    """
+    if method_has_self(method) or not re.search(r"\bself\b", logic):
+        return logic
+    if method_returns_result(method):
+        rewritten = re.sub(r"\bself\.", "result.as_ref().unwrap().", logic)
+        # Replace bare `self` (e.g. the `self` in `*self`) -- the `*` is already in the
+        # source expression, so just swap the identifier without adding another dereference.
+        rewritten = re.sub(r"\bself\b", "result.as_ref().unwrap()", rewritten)
+        return f"result.is_ok() && {rewritten}"
+    rewritten = re.sub(r"\bself\.", "result.", logic)
+    rewritten = re.sub(r"\bself\b", "result", rewritten)
+    return rewritten
+
+
+def parse_arg_types(args: str) -> dict[str, str]:
+    """Map parameter name -> declared type for a method's `rust_sig` args."""
+    types: dict[str, str] = {}
+    if not args:
+        return types
+    for raw_arg in args.split(","):
+        arg = raw_arg.strip()
+        if not arg or arg in {"self", "&self", "&mut self"} or ":" not in arg:
+            continue
+        name, ty = arg.split(":", 1)
+        types[name.strip().removeprefix("mut ").strip()] = ty.strip()
+    return types
+
+
+def creusot_query_return_types(methods: list[Method]) -> dict[str, str]:
+    """Map query method name -> declared return type."""
+    types: dict[str, str] = {}
+    for candidate in methods:
+        if candidate.kind != "query":
+            continue
+        _name, _args, ret_ty = method_signature_parts(candidate.rust_sig)
+        types[candidate.name] = ret_ty
+    return types
+
+
+def rewrite_string_view_mismatches_for_creusot(logic: str, method: Method, methods: list[Method]) -> str:
+    """Fix `result.<getter>() == <param>` where the getter returns a borrowed
+    view (`&str`/`Option<&str>`) of a constructor parameter declared as the
+    owned type (`String`/`Option<String>`), which Creusot's `equal::<T>`
+    rejects as a type mismatch."""
+    param_types = parse_arg_types(method_signature_parts(method.rust_sig)[1])
+    query_types = creusot_query_return_types(methods)
+
+    def repl(match: re.Match[str]) -> str:
+        getter, op, rhs = match["getter"], match["op"], match["rhs"]
+        getter_ty = query_types.get(getter)
+        rhs_ty = param_types.get(rhs)
+        if getter_ty == "&str" and rhs_ty == "String":
+            return f"result.{getter}() {op} {rhs}.as_str()"
+        if getter_ty == "Option<&str>" and rhs_ty == "Option<String>":
+            return f"result.{getter}() {op} {rhs}.as_deref()"
+        return match[0]
+
+    pattern = r"result\.(?P<getter>[A-Za-z_]\w*)\(\)\s*(?P<op>==|!=)\s*(?P<rhs>[A-Za-z_]\w*)\b"
+    return re.sub(pattern, repl, logic)
 
 
 def method_signature_parts(signature: str) -> tuple[str, str, str]:
@@ -889,48 +1451,347 @@ def creusot_signature_variant(signature: str) -> str | None:
     return signature.replace("&mut dyn RngCore", "&mut CreusotRngCore")
 
 
-def emit_method_body(lines: list[str], signature: str) -> None:
-    lines.append(f"    pub {signature} {{")
+def emit_method_body(lines: list[str], signature: str, *, pub: bool = True, body: bool = True) -> None:
+    """Emit one method. `pub=False` for trait-impl/trait-declaration methods,
+    which are never individually `pub`-qualified in Rust regardless of the
+    surrounding impl/trait's own visibility. `body=False` emits a bodyless
+    trait method declaration (`;`) instead of an `unimplemented!()` body."""
+    qualifier = "pub " if pub else ""
+    if not body:
+        lines.append(f"    {qualifier}{signature};")
+        return
+    lines.append(f"    {qualifier}{signature} {{")
     lines.append("        unimplemented!()")
     lines.append("    }")
 
 
+def compute_creusot_maps(
+    spec: dict[str, Any], methods: list[Method]
+) -> tuple[dict[str, str], dict[tuple[str, str], str], dict[str, Method], set[str]]:
+    """Precompute the Creusot logic-model companion maps shared by every
+    emission path (inherent impl, trait impl, trait declaration) for a
+    verifier=creusot spec. Empty maps for non-creusot specs and for
+    kind='trait' (a trait has no concrete state to model a companion over --
+    constraints needing one fall back to the sentinel, same as an unmodeled
+    query on a concrete concept today)."""
+    creusot_model_map = (
+        creusot_query_model_companions(methods)
+        if spec.get("verifier") == "creusot"
+        else {}
+    )
+    creusot_chain_map = (
+        creusot_chain_model_companions(methods, spec)
+        if spec.get("verifier") == "creusot"
+        else {}
+    )
+    query_by_name = {m.name: m for m in methods if m.kind == "query"}
+    creusot_option_f64_names = {
+        creusot_model_map[m.name]
+        for m in methods
+        if m.name in creusot_model_map
+        and method_signature_parts(m.rust_sig)[2].replace(" ", "") == "Option<f64>"
+    }
+    return creusot_model_map, creusot_chain_map, query_by_name, creusot_option_f64_names
+
+
+def emit_method_contract_attrs(
+    lines: list[str],
+    spec: dict[str, Any],
+    method: Method,
+    methods: list[Method],
+    creusot_model_map: dict[str, str],
+    creusot_chain_map: dict[tuple[str, str], str],
+    creusot_option_f64_names: set[str],
+) -> None:
+    """Emit `#[cfg_attr(kani|creusot, requires/ensures(...))]` attributes for
+    one method's applicable constraints. Shared by inherent-impl emission,
+    trait-impl emission (where it is simply not called -- see
+    `emit_plain_impl`), and trait-declaration emission (`emit_trait_def`).
+
+    A no-op for verifier=="verus": `emit_verus_impl` calls `emit_plain_impl`
+    a second time (gated by `cfg(not(verus))`) as the non-verus fallback
+    impl, which must carry no contract attributes at all -- verus is the
+    concept's sole verifier and the raw restricted-English `logic` isn't
+    valid Rust for kani::requires without translation. For verifier in
+    {"kani", "creusot"}, both attribute forms are emitted regardless of
+    which one is the spec's declared primary verifier -- gated by
+    `cfg_attr` so only the tool actually invoked (`--cfg kani` / `--cfg
+    creusot`) sees its own attribute. This lets the same generated stub be
+    checked under either verifier, not just the declared one."""
+    if spec["verifier"] == "verus":
+        return
+    for constraint in applicable_constraints(spec, method):
+        logic = constraint.get("logic", "").strip()
+        if not logic:
+            continue
+
+        kani_raw = rewrite_static_self_for_kani(logic, method)
+        kani_logic = translate_logic_to_kani(kani_raw)
+        # Evaluate is_post AFTER rewrite: invariants on static methods become
+        # postconditions once self.* is rewritten to result.* (mirrors the
+        # analogous Creusot rewrite below).
+        is_post = constraint.get("kind") == "postcondition" or bool(re.search(r"\bresult\b", kani_logic))
+        if is_post:
+            lines.append(f"    #[cfg_attr(kani, kani::ensures(|result| {kani_logic}))]")
+        else:
+            lines.append(f"    #[cfg_attr(kani, kani::requires({kani_logic}))]")
+
+        creusot_raw = rewrite_logic_for_creusot(logic, method, methods)
+        if creusot_constraint_in_scope(creusot_raw, method):
+            creusot_attr = "ensures" if constraint.get("kind") == "postcondition" or re.search(r"\bresult\b", creusot_raw) else "requires"
+            # Reroute integer/bool/f64 query calls to their #[logic] model
+            # companions so the constraint is real Pearlite, not a `true`
+            # sentinel. A constraint still referencing an unmodeled query
+            # (string/reference returns) keeps a targeted sentinel.
+            # Rewrite chained Int-terminal calls (self.q(args).len()/.size())
+            # to their models first (#349), then the per-query int/bool models.
+            rerouted = _replace_chain_calls(creusot_raw, creusot_chain_map)
+            rerouted = _replace_query_calls(rerouted, creusot_model_map)
+            _method_name, method_args, _method_ret = method_signature_parts(method.rust_sig)
+            option_names = set(creusot_option_f64_names)
+            option_names.update(
+                name
+                for name, ty in parse_arg_types(method_args).items()
+                if ty.replace(" ", "") == "Option<f64>"
+            )
+            rerouted = _replace_creusot_option_f64_equalities(rerouted, option_names)
+            # For &mut self postconditions, rewrite old(self.X()) ->
+            # (*self).X() and self.X() -> (^self).X() so Creusot sees
+            # Pearlite prophecy notation instead of old() (#348).
+            if method_has_mut_self(method) and creusot_attr == "ensures":
+                rerouted = _rewrite_mut_self_prophecy_for_creusot(rerouted)
+            translated = translate_logic_to_creusot(rerouted)
+            # Fix usize parameter references in Pearlite logic context.
+            # index.0@ is for newtype wrappers; plain usize params use index@.
+            usize_params = _creusot_usize_param_names(method)
+            if "index.0@ <" in translated and "index" in usize_params:
+                translated = translated.replace("index.0@ <", "index@ <")
+            # Executable usize parameters need their mathematical view in
+            # Pearlite, including when passed to an Int model companion.
+            for _uname in usize_params:
+                translated = re.sub(
+                    rf"\b{re.escape(_uname)}\b(?![@(])", f"{_uname}@", translated
+                )
+            # Domain index newtypes expose their inner usize before
+            # taking the mathematical view expected by Int models.
+            for _iname in _creusot_domain_index_param_names(method):
+                translated = re.sub(
+                    rf"\b{re.escape(_iname)}\b(?![.@(])", f"{_iname}.0@", translated
+                )
+            all_models = set(creusot_model_map.values()) | set(creusot_chain_map.values())
+            if creusot_logic_unmodeled(translated, all_models):
+                creusot_logic = "true /* TODO(concept-to-code): generated query method needs Pearlite model helper */"
+            else:
+                creusot_logic = translated
+            lines.append(
+                "    #[cfg_attr(creusot, "
+                f"{CONTRACTS_CREUSOT}::{creusot_attr}({creusot_logic}))]"
+            )
+
+
+def _emit_impl_method(
+    lines: list[str],
+    spec: dict[str, Any],
+    method: Method,
+    methods: list[Method],
+    creusot_model_map: dict[str, str],
+    creusot_chain_map: dict[tuple[str, str], str],
+    creusot_option_f64_names: set[str],
+    *,
+    emit_contracts: bool,
+    pub: bool,
+) -> None:
+    """Emit one method inside an impl block (inherent or `impl Trait for X`).
+
+    `emit_contracts=False` is used for trait-satisfying methods (`implements`):
+    Creusot checks contract refinement from the trait's own declaration
+    automatically, so restating `#[cfg_attr(creusot, ...)]` here would be
+    redundant at best and risk drifting from the trait's contract at worst.
+    `pub=False` matches Rust's own rule that `impl Trait for X` methods are
+    never individually `pub`-qualified."""
+    lines.append("")
+    lines.extend(f"    {line}" for line in doc_lines(method.english))
+    if emit_contracts:
+        emit_method_contract_attrs(
+            lines, spec, method, methods, creusot_model_map, creusot_chain_map, creusot_option_f64_names
+        )
+    creusot_sig = creusot_signature_variant(method.rust_sig) if spec["verifier"] == "creusot" else None
+    if creusot_sig is not None:
+        lines.append("    #[cfg(creusot)]")
+        emit_method_body(lines, creusot_sig, pub=pub)
+        lines.append("    #[cfg(not(creusot))]")
+        emit_method_body(lines, method.rust_sig, pub=pub)
+    else:
+        emit_method_body(lines, method.rust_sig, pub=pub)
+
+
 def emit_plain_impl(lines: list[str], spec: dict[str, Any], methods: list[Method], *, cfg: str | None = None) -> None:
     concept = spec["concept"]
+    creusot_model_map, creusot_chain_map, query_by_name, creusot_option_f64_names = compute_creusot_maps(spec, methods)
+    implements: dict[str, dict[str, Any]] = spec.get("implements", {})
+    trait_method_names: set[str] = {
+        name for trait_info in implements.values() for name in trait_info["methods"]
+    }
+    inherent_methods = [m for m in methods if m.name not in trait_method_names]
+
     if cfg:
         lines.append(cfg)
     lines.extend(doc_lines(spec["english_description"]))
     lines.append(f"pub struct {concept};")
     lines.append("")
+
+    # `implements`: each named trait gets its own `impl Trait for Concept`
+    # block, methods routed there instead of the inherent impl, with no
+    # contract attributes -- Creusot's refinement checking reads the
+    # contract from the trait's own declaration.
+    for trait_name, trait_info in implements.items():
+        if cfg:
+            lines.append(cfg)
+        lines.append(f"impl {trait_name} for {concept} {{")
+        for method_name in trait_info["methods"]:
+            method = next(m for m in methods if m.name == method_name)
+            _emit_impl_method(
+                lines, spec, method, methods,
+                creusot_model_map, creusot_chain_map, creusot_option_f64_names,
+                emit_contracts=False, pub=False,
+            )
+        lines.append("}")
+        lines.append("")
+
     if cfg:
         lines.append(cfg)
     lines.append(f"impl {concept} {{")
+    for method in inherent_methods:
+        if method.name in creusot_model_map:
+            lines.append("")
+            emit_creusot_query_model_companion(lines, method, creusot_model_map[method.name])
+    for (chain_q, _term), chain_model in creusot_chain_map.items():
+        if chain_q in {m.name for m in inherent_methods}:
+            lines.append("")
+            emit_creusot_chain_model_companion(lines, query_by_name[chain_q], chain_model)
+    for method in inherent_methods:
+        _emit_impl_method(
+            lines, spec, method, methods,
+            creusot_model_map, creusot_chain_map, creusot_option_f64_names,
+            emit_contracts=True, pub=True,
+        )
+    lines.append("}")
+
+
+def emit_trait_def(lines: list[str], spec: dict[str, Any], methods: list[Method]) -> None:
+    """Emit `pub trait {concept} { ... }` for kind='trait'.
+
+    Method declarations are bodyless (`;`), never `pub`-qualified (trait
+    methods inherit visibility from the trait item itself), and carry
+    contracts directly -- concrete `impl {concept} for Concrete` blocks are
+    checked for refinement against these by Creusot automatically, not
+    restated.
+
+    Creusot logic-model companions ARE emitted here, as default-bodied trait
+    methods (`pub=False`, same as the bodyless declarations -- Rust forbids
+    individually `pub`-qualifying any trait item regardless of whether it has
+    a body). Their bodies are trusted/opaque placeholder values keyed only by
+    the query's return type, never concrete fields, so they are exactly as
+    valid as a trait default as they are as an inherent impl method, and
+    every implementor inherits the same one instead of each restating an
+    identical copy. Omitting these silently downgrades working contracts to
+    sentinels for no real reason, since the companion never depended on
+    concrete state to begin with (see beast-rs's T-476 findings for the
+    regression this caught in the original upstream implementation)."""
+    concept = spec["concept"]
+    creusot_model_map, creusot_chain_map, query_by_name, creusot_option_f64_names = compute_creusot_maps(spec, methods)
+    lines.extend(doc_lines(spec["english_description"]))
+    lines.append(f"pub trait {concept} {{")
+    for method in methods:
+        if method.name in creusot_model_map:
+            lines.append("")
+            emit_creusot_query_model_companion(lines, method, creusot_model_map[method.name], pub=False)
+    for (chain_q, _term), chain_model in creusot_chain_map.items():
+        lines.append("")
+        emit_creusot_chain_model_companion(lines, query_by_name[chain_q], chain_model, pub=False)
     for method in methods:
         lines.append("")
         lines.extend(f"    {line}" for line in doc_lines(method.english))
-        for constraint in applicable_constraints(spec, method):
-            logic = constraint.get("logic", "").strip()
-            if logic and spec["verifier"] != "verus":
-                lines.append(f"    #[cfg_attr(kani, kani::requires({logic}))]")
-                creusot_raw = rewrite_logic_for_creusot(logic, method)
-                if creusot_constraint_in_scope(creusot_raw, method):
-                    creusot_attr = "ensures" if constraint.get("kind") == "postcondition" or re.search(r"\bresult\b", creusot_raw) else "requires"
-                    if creusot_needs_query_model(creusot_raw):
-                        creusot_logic = "true /* TODO(concept-to-code): generated query method needs Pearlite model helper */"
-                    else:
-                        creusot_logic = translate_logic_to_creusot(creusot_raw)
-                    lines.append(
-                        "    #[cfg_attr(creusot, "
-                        f"{CONTRACTS_CREUSOT}::{creusot_attr}({creusot_logic}))]"
-                    )
+        emit_method_contract_attrs(
+            lines, spec, method, methods, creusot_model_map, creusot_chain_map, creusot_option_f64_names
+        )
+        # Mirrors _emit_impl_method's dual-signature handling exactly: under a
+        # plain (non-creusot) build the trait's single declaration and every
+        # implementor's #[cfg(not(creusot))] variant both use `dyn RngCore`,
+        # so the mismatch is invisible to `cargo check`. Creusot's own build
+        # activates cfg(creusot), where implementors switch to a Creusot-safe
+        # signature (cargo-creusot rejects dyn trait object parameters) -- a
+        # trait declaration that never splits the same way produces a genuine
+        # signature mismatch the moment Creusot compiles it.
         creusot_sig = creusot_signature_variant(method.rust_sig) if spec["verifier"] == "creusot" else None
         if creusot_sig is not None:
             lines.append("    #[cfg(creusot)]")
-            emit_method_body(lines, creusot_sig)
+            emit_method_body(lines, creusot_sig, pub=False, body=False)
             lines.append("    #[cfg(not(creusot))]")
-            emit_method_body(lines, method.rust_sig)
+            emit_method_body(lines, method.rust_sig, pub=False, body=False)
         else:
-            emit_method_body(lines, method.rust_sig)
+            emit_method_body(lines, method.rust_sig, pub=False, body=False)
+    lines.append("}")
+
+
+def emit_enum_impl(lines: list[str], spec: dict[str, Any]) -> None:
+    """Emit `pub enum {concept} { Variant(Concrete), ... }` plus a
+    match-dispatched inherent method per trait method, for kind='enum'. No
+    `dyn` anywhere -- some deductive verifiers (e.g. Creusot) cannot verify
+    trait object reasoning, so a closed enum of concrete variants is the
+    composition mechanism for a heterogeneous set of concrete concepts."""
+    concept = spec["concept"]
+    trait_ref = spec["trait_ref"]
+    trait_spec = resolve_cross_crate_spec(trait_ref["crate"], trait_ref["concept"])
+    if concept_kind(trait_spec) != "trait":
+        raise SpecError(
+            f"trait_ref {trait_ref['crate']}::{trait_ref['concept']} is not kind='trait'"
+        )
+    trait_methods = validate_spec(trait_spec)
+    variants = spec["variants"]
+
+    lines.extend(doc_lines(spec["english_description"]))
+    lines.append(f"pub enum {concept} {{")
+    for variant in variants:
+        lines.append(f"    {variant['name']}({variant['wraps']['concept']}),")
+    lines.append("}")
+    lines.append("")
+    lines.append(f"impl {concept} {{")
+    for method in trait_methods:
+        name, args, ret = method_signature_parts(method.rust_sig)
+        # `args` (from method_signature_parts) already includes the receiver
+        # (`&self`/`&mut self`) as written in rust_sig -- reuse it verbatim
+        # for the signature. `parse_arg_types` explicitly skips the receiver,
+        # so its keys are exactly the arguments to forward to the concrete
+        # variant's own method call.
+        forward_args = ", ".join(parse_arg_types(args).keys())
+        ret_part = f" -> {ret}" if ret else ""
+        lines.append("")
+        lines.extend(f"    {line}" for line in doc_lines(method.english))
+
+        def emit_dispatch_body(sig_args: str) -> None:
+            lines.append(f"    pub fn {name}({sig_args}){ret_part} {{")
+            lines.append("        match self {")
+            for variant in variants:
+                lines.append(
+                    f"            {concept}::{variant['name']}(op) => op.{name}({forward_args}),"
+                )
+            lines.append("        }")
+            lines.append("    }")
+
+        # Mirrors _emit_impl_method / emit_trait_def's dual-signature
+        # handling: the enum's own dispatch method forwards its arguments
+        # unchanged, so its parameter types must match whichever cfg branch
+        # the variant's own method is in, or the forwarding call itself
+        # becomes a type mismatch under cfg(creusot).
+        creusot_args = creusot_signature_variant(args) if trait_spec["verifier"] == "creusot" else None
+        if creusot_args is not None:
+            lines.append("    #[cfg(creusot)]")
+            emit_dispatch_body(creusot_args)
+            lines.append("    #[cfg(not(creusot))]")
+            emit_dispatch_body(args)
+        else:
+            emit_dispatch_body(args)
     lines.append("}")
 
 
@@ -1022,21 +1883,60 @@ def emit_module(spec: dict[str, Any], methods: list[Method]) -> str:
     lines.append("")
     lines.append("#![allow(unexpected_cfgs)]")
     lines.append("")
-    for use_path in spec.get("supplementary_imports", []) or []:
+    effective_supplementary_imports = list(spec.get("supplementary_imports", []) or [])
+    if concept_kind(spec) == "enum":
+        # Dispatch methods call trait methods on each variant (e.g. `op.name()`
+        # where `name` comes from `impl Trait for Concrete`, not an inherent
+        # impl) -- Rust requires the trait itself in scope to call its methods
+        # via dot-syntax, even on a type that implements it. This is
+        # structurally required for every enum-kind concept, not a
+        # spec-author choice, so it is computed here rather than left to
+        # manual `supplementary_imports`.
+        # `as _` (Rust's unnameable-import idiom): brings the trait's methods
+        # into scope for dot-syntax dispatch calls without binding the
+        # trait's own name -- an enum-kind concept is free to share its
+        # identifier with the trait it wraps once they live in different
+        # crates, and a plain `use` would collide with the enum's own name.
+        trait_ref = spec["trait_ref"]
+        trait_crate_ident = trait_ref["crate"].replace("-", "_")
+        trait_module = snake_case(trait_ref["concept"])
+        trait_use_path = f"{trait_crate_ident}::{trait_module}::{trait_ref['concept']} as _"
+        if trait_use_path not in effective_supplementary_imports:
+            effective_supplementary_imports.insert(0, trait_use_path)
+    for use_path in effective_supplementary_imports:
         if spec["verifier"] == "verus":
             lines.append(NOT_VERUS_CFG)
         lines.append(f"use {use_path};")
-    if spec.get("supplementary_imports"):
+    if effective_supplementary_imports:
         lines.append("")
     if spec["verifier"] == "verus":
         lines.append(VERUS_CFG)
         lines.append(f"use {CONTRACTS_VERUS_PRELUDE}::*;")
         lines.append("")
+    if spec["verifier"] == "creusot" and (
+        creusot_query_model_companions(methods)
+        or creusot_chain_model_companions(methods, spec)
+    ):
+        # Narrow imports for the emitted query-model companions: the
+        # `logic`/`trusted` attribute macros, the `pearlite!` body macro, and
+        # the `Int` logic type. A broad `creusot::*` glob would drag in
+        # creusot-std's own prelude and risk colliding with the concept
+        # module's own imports.
+        lines.append("#[cfg(creusot)]")
+        lines.append(f"use {CONTRACTS_CREUSOT}::{{logic, trusted}};")
+        lines.append("#[cfg(creusot)]")
+        lines.append(f"use {CONTRACTS_CREUSOT}::prelude::*;")
+        lines.append("")
     for constraint in spec.get("constraints", []):
         lines.extend(doc_lines(constraint.get("english", "")))
         lines.append(f"pub const {constraint_const_name(constraint)}: &str = {rust_string(constraint.get('logic', ''))};")
         lines.append("")
-    if spec["verifier"] == "verus":
+    kind = concept_kind(spec)
+    if kind == "trait":
+        emit_trait_def(lines, spec, methods)
+    elif kind == "enum":
+        emit_enum_impl(lines, spec)
+    elif spec["verifier"] == "verus":
         emit_verus_impl(lines, spec, methods)
     else:
         emit_plain_impl(lines, spec, methods)
@@ -1059,6 +1959,14 @@ def emit_props(spec: dict[str, Any]) -> str:
     lines: list[str] = []
     lines.append("//! Generated by emit_stubs.py (concept-to-code skill). Do not hand-edit.")
     lines.append(f"//! Proptest scaffolding for {concept}.")
+    if concept_kind(spec) == "enum":
+        # kind='enum' has no constraints/adversary_table of its own -- the
+        # real behavior contract lives on the trait_ref and each wrapped
+        # variant's own concept. An empty 0usize..0 proptest range panics at
+        # test time, so there is nothing meaningful to scaffold here; each
+        # variant's own concept already has its own props file.
+        lines.append("//! kind='enum': no local constraints/adversary_table to scaffold.")
+        return "\n".join(lines) + "\n"
     lines.append("")
     lines.append("use proptest::prelude::*;")
     lines.append("")
@@ -1117,9 +2025,56 @@ def emit_props(spec: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def default_paths(spec: dict[str, Any], crate_dir: Path) -> tuple[Path, Path]:
+def emit_kani_f64_harness(spec: dict[str, Any]) -> str:
+    """Emit implementation-stage f64 checks supplementing Creusot contracts.
+
+    Generates one `#[kani::proof]` harness per `kani_f64_checks` entry,
+    checking exactly the f64 sign/finiteness obligations a Creusot-primary
+    concept's own contracts can't express in Pearlite logic (see
+    docs/spec-first-workflow.md and verifiers/creusot/step-c-verify.md for
+    when to reach for this)."""
+    concept = spec["concept"]
+    module_name = snake_case(concept)
+    checks = spec.get("kani_f64_checks", [])
+    imports = sorted(
+        {import_path for check in checks for import_path in check.get("imports", [])}
+    )
+    lines = [
+        "//! Generated by emit_stubs.py (concept-to-code skill). Do not hand-edit.",
+        f"//! Supplementary Kani f64 checks for Creusot-primary {concept}.",
+        "",
+        "#![cfg(kani)]",
+        "",
+    ]
+    for import_path in imports:
+        lines.append(f"use {import_path};")
+    if imports:
+        lines.append("")
+    for check in checks:
+        lines.append("#[kani::proof]")
+        if check["expected"] == "panic":
+            lines.append("#[kani::should_panic]")
+        lines.append(f"fn kani_f64_{module_name}_{check['name']}() {{")
+        for symbol in check["symbolic_f64s"]:
+            lines.append(f"    let {symbol}: f64 = kani::any();")
+        for assumption in check["assumptions"]:
+            lines.append(f"    kani::assume({assumption});")
+        for statement in check["statements"]:
+            lines.append(f"    {statement.rstrip(';')};")
+        for assertion in check.get("assertions", []):
+            lines.append(f"    assert!({assertion});")
+        lines.append("}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def default_paths(spec: dict[str, Any], crate_dir: Path) -> tuple[Path, Path, Path]:
     module = snake_case(spec["concept"])
-    return crate_dir / "src" / f"{module}.rs", crate_dir / "tests" / f"props_{module}.rs"
+    return (
+        crate_dir / "src" / f"{module}.rs",
+        crate_dir / "tests" / f"props_{module}.rs",
+        crate_dir / "tests" / f"kani_f64_{module}.rs",
+    )
 
 
 def main(argv: list[str]) -> int:
@@ -1128,31 +2083,48 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--crate-dir", type=Path, required=True, help="Path to the target crate root (containing src/ and tests/)")
     parser.add_argument("--module-out", type=Path)
     parser.add_argument("--props-out", type=Path)
+    parser.add_argument("--kani-f64-out", type=Path)
     parser.add_argument(
         "--contracts-crate",
         default="contracts",
         help="Crate name for the verifier-contracts facade exposing "
         "<crate>::creusot::* and <crate>::verus::prelude::* (default: 'contracts')",
     )
+    parser.add_argument(
+        "--specs-search-root",
+        type=Path,
+        help="Root directory searched for another crate's spec JSON when resolving "
+        "implements/trait_ref/variants cross-crate references, as "
+        "<root>/<crate>/specs/<snake_case(concept)>.json. Defaults to the parent "
+        "of --crate-dir, so a single-crate invocation with no cross-crate "
+        "references is unaffected.",
+    )
     parser.add_argument("--check", action="store_true", help="validate only; do not write files")
     args = parser.parse_args(argv)
 
-    global CONTRACTS_CREUSOT, CONTRACTS_VERUS_PRELUDE
+    global CONTRACTS_CREUSOT, CONTRACTS_VERUS_PRELUDE, SPECS_SEARCH_ROOT
     CONTRACTS_CREUSOT = f"{args.contracts_crate}::creusot"
     CONTRACTS_VERUS_PRELUDE = f"{args.contracts_crate}::verus::prelude"
+    SPECS_SEARCH_ROOT = args.specs_search_root or args.crate_dir.parent
 
     try:
         spec = json.loads(args.spec_json.read_text())
         methods = validate_spec(spec)
-        module_out, props_out = default_paths(spec, args.crate_dir)
+        module_out, props_out, kani_f64_out = default_paths(spec, args.crate_dir)
         if args.module_out:
             module_out = args.module_out
         if args.props_out:
             props_out = args.props_out
+        if args.kani_f64_out:
+            kani_f64_out = args.kani_f64_out
         module = emit_module(spec, methods)
         props = emit_props(spec)
+        kani_f64 = emit_kani_f64_harness(spec) if spec.get("kani_f64_checks") else None
         if args.check:
-            print(f"valid: {spec['concept']} -> {module_out} and {props_out}")
+            outputs = [str(module_out), str(props_out)]
+            if kani_f64 is not None:
+                outputs.append(str(kani_f64_out))
+            print(f"valid: {spec['concept']} -> {' and '.join(outputs)}")
             return 0
         module_out.parent.mkdir(parents=True, exist_ok=True)
         props_out.parent.mkdir(parents=True, exist_ok=True)
@@ -1160,6 +2132,10 @@ def main(argv: list[str]) -> int:
         props_out.write_text(props)
         print(f"wrote {module_out}")
         print(f"wrote {props_out}")
+        if kani_f64 is not None:
+            kani_f64_out.parent.mkdir(parents=True, exist_ok=True)
+            kani_f64_out.write_text(kani_f64)
+            print(f"wrote {kani_f64_out}")
         return 0
     except (OSError, json.JSONDecodeError, SpecError) as exc:
         print(f"emit_stubs.py: error: {exc}", file=sys.stderr)

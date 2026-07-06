@@ -61,6 +61,39 @@ and sequence facts. Only combine machine-level bounds with model-level facts
 when the task explicitly requires both executable safety and mathematical
 meaning.
 
+## Logic-Model Companions
+
+Pearlite cannot call an ordinary Rust method from inside a contract — a
+constraint like `self.child_count() <= 2` referencing a query fails with
+"called program function ... in logic context". `emit_stubs.py` works around
+this automatically for queries returning an integer type, `bool`, `f64`, or
+`Option<f64>`: it generates a trusted, opaque logic companion
+
+```rust
+#[cfg(creusot)]
+#[trusted]
+#[logic(opaque)]
+fn child_count_model(self) -> Int { pearlite! { 0 } }
+```
+
+and rewrites `self.child_count()` (or `old(self.child_count())` /
+`final(self.child_count())`) in constraint logic to
+`self.child_count_model()` before translation. The companion's body is a
+fixed placeholder keyed only by the return type — it never reads concrete
+fields, so it is equally valid whether emitted on an inherent impl or (for
+`kind: "trait"` concepts) as a trait default method inherited by every
+implementor. A chained call ending in `.len()`/`.size()`/etc.
+(`self.taxon_set().size()`) gets an analogous `<query>_<term>_model()`
+companion. A constraint that still calls an unmodeled query afterward (one
+returning `&str`, `&T`, or another `Option<_>`) degrades to a visible
+`true /* TODO(concept-to-code): ... */` sentinel rather than silently
+compiling to `true` with no marker.
+
+`&mut self` postconditions get an additional rewrite into Pearlite's
+prophecy notation: `old(self.X(args))` becomes `(*self).X(args)` (pre-state)
+and bare `self.X(args)` becomes `(^self).X(args)` (post-state), since Creusot
+has no `old()` for mutable receivers.
+
 ## Reversibility And Operators
 
 For state-transition operators, specify symbolic obligations first. Example,

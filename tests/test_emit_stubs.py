@@ -10,8 +10,29 @@ if str(TEST_DIR) not in sys.path:
     sys.path.insert(0, str(TEST_DIR))
 
 try:
-    from tests.emit_stubs_test import EmitStubsTests, TranslateLogicToVerusTests
+    from tests.emit_stubs_test import (
+        EmitStubsTests,
+        KaniF64HarnessTests,
+        RewriteStringViewMismatchesForCreusotTests,
+        TraitEnumConceptKindTests,
+        TranslateLogicToCreusotTests,
+        TranslateLogicToVerusTests,
+    )
 except ModuleNotFoundError:
-    from emit_stubs_test import EmitStubsTests, TranslateLogicToVerusTests
+    from emit_stubs_test import (
+        EmitStubsTests,
+        KaniF64HarnessTests,
+        RewriteStringViewMismatchesForCreusotTests,
+        TraitEnumConceptKindTests,
+        TranslateLogicToCreusotTests,
+        TranslateLogicToVerusTests,
+    )
 
-__all__ = ["EmitStubsTests", "TranslateLogicToVerusTests"]
+__all__ = [
+    "EmitStubsTests",
+    "KaniF64HarnessTests",
+    "RewriteStringViewMismatchesForCreusotTests",
+    "TraitEnumConceptKindTests",
+    "TranslateLogicToCreusotTests",
+    "TranslateLogicToVerusTests",
+]

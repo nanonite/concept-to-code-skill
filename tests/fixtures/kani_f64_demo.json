@@ -1,0 +1,49 @@
+{
+  "schema_version": "1.0",
+  "concept": "RateScaler",
+  "cluster": "demo-kani-f64",
+  "english_description": "Scales a rate value by a strictly positive factor, used to demonstrate the supplementary Kani f64 harness mechanism for Creusot-primary concepts whose sign or finiteness obligations cannot be expressed in Pearlite logic.",
+  "queries": [
+    {
+      "english": "What is the current rate?",
+      "rust_sig": "fn rate(&self) -> f64",
+      "pure": true
+    }
+  ],
+  "commands": [
+    {
+      "english": "Scale the rate by the given strictly positive factor.",
+      "rust_sig": "fn scale(&mut self, factor: f64)"
+    }
+  ],
+  "constraints": [
+    {
+      "english": "The rate is always finite and positive.",
+      "logic": "self.rate() > 0.0",
+      "kind": "invariant"
+    }
+  ],
+  "adversary_table": [
+    {
+      "scenario": "A caller passes a negative or NaN scale factor.",
+      "violates": "the rate stays finite and positive",
+      "resolution": "scale rejects (or clamps) so the rate invariant cannot be broken by construction."
+    }
+  ],
+  "verifier": "creusot",
+  "kani_f64_checks": [
+    {
+      "name": "scale_preserves_finite_sign",
+      "symbolic_f64s": ["rate", "factor"],
+      "assumptions": [
+        "rate.is_finite()",
+        "rate > 0.0",
+        "factor.is_finite()",
+        "factor > 0.0"
+      ],
+      "statements": ["let scaled = rate * factor"],
+      "assertions": ["scaled.is_finite()", "scaled > 0.0"],
+      "expected": "pass"
+    }
+  ]
+}

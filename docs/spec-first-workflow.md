@@ -78,6 +78,38 @@ somewhere (e.g. an architecture decision record) and reference that document
 here; absent such a decision, default new crates to Kani until one is
 recorded.
 
+**Creusot logic-model companions.** For `verifier: "creusot"`, a query
+returning an integer type, `bool`, `f64`, or `Option<f64>` gets a generated
+`<query>_model()` (or, for a chained `self.<q>(args).<term>()` call ending in
+`.len()`/`.size()`/etc., a `<q>_<term>_model()`) trusted/opaque Pearlite logic
+companion, and constraints referencing that query are rewritten to call the
+companion instead of the program method (which Creusot rejects in logic
+context). A constraint still referencing an unmodeled query (string/reference
+returns) degrades to a visible `TODO(concept-to-code)` sentinel rather than
+silently passing. `&mut self` postconditions are rewritten into Pearlite's
+`*self`/`^self` prophecy notation automatically.
+
+**Trait/enum concept kinds.** `kind: "trait"` (a `pub trait` with contracts
+on bodyless method declarations) and `kind: "enum"` (a closed `pub enum`
+dispatching to named concrete variants) are the composition mechanism for a
+shared interface implemented by several concrete concepts, for verifiers that
+cannot reason about `dyn Trait` (Creusot). Reach for `kind: "trait"` at Step 1
+when the concept under analysis genuinely describes a shared interface rather
+than one concrete behavior; most concepts stay `kind: "struct"` (the
+default). See `tests/fixtures/trait_enum_demo/` for a worked example and
+SKILL.md's "Concept kinds" section for the schema fields involved
+(`implements`, `trait_ref`, `variants`).
+
+**Supplementary Kani f64 checks.** If your Creusot toolchain's Pearlite
+logic lacks `f64: OrdLogic` (or another f64 sign/finiteness obligation your
+contracts need), add `kani_f64_checks` to a Creusot-primary concept at
+implementation time (not at Step 4/5) rather than degrading the whole
+concept's verifier choice. This generates a supplementary
+`tests/kani_f64_<concept>.rs` Kani harness checking exactly the f64
+obligations Creusot logic can't express yet, alongside the concept's
+Creusot-checked contracts. See `tests/fixtures/kani_f64_demo.json` and
+`verifiers/creusot/step-c-verify.md`'s "Supplementary Kani f64 gate" section.
+
 ## Step 6: Static Checking
 
 Paper step: run the checker before real method bodies are written.

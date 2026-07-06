@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0",
+  "concept": "FastToggle",
+  "cluster": "demo-toggle",
+  "english_description": "A toggle implementation that flips instantly with no internal delay, used to demonstrate the implements mechanism for trait/enum concept-kinds.",
+  "queries": [
+    {
+      "english": "Is the toggle currently on?",
+      "rust_sig": "fn is_on(&self) -> bool",
+      "pure": true
+    }
+  ],
+  "commands": [
+    {
+      "english": "Flip the toggle to the opposite state.",
+      "rust_sig": "fn flip(&mut self)"
+    }
+  ],
+  "constraints": [
+    {
+      "english": "Flipping the toggle changes its on/off state.",
+      "logic": "self.is_on() == !old(self.is_on())",
+      "kind": "postcondition",
+      "applies_to": ["flip"]
+    }
+  ],
+  "adversary_table": [
+    {
+      "scenario": "Flip is called twice in a row.",
+      "violates": "toggle state changes on every flip",
+      "resolution": "Second flip returns the toggle to its original state; no panics."
+    }
+  ],
+  "verifier": "creusot",
+  "implements": {
+    "Toggle": {
+      "crate": "democrate",
+      "methods": ["is_on", "flip"]
+    }
+  }
+}

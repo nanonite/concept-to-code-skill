@@ -134,8 +134,16 @@ class EmitStubsTests(unittest.TestCase):
         methods = emit_stubs.validate_spec(concept)
         module = emit_stubs.emit_module(concept, methods)
 
+        # site_count returns usize, a modelable Creusot logic type, so the
+        # postcondition routes through the generated site_count_model()
+        # companion (in &mut self prophecy notation) instead of degrading to
+        # the "no logic model yet" sentinel.
         self.assertIn(
-            "#[cfg_attr(creusot, contracts::creusot::ensures(true /* TODO(concept-to-code): generated query method needs Pearlite model helper */))]",
+            "#[cfg_attr(creusot, contracts::creusot::ensures((^self).site_count_model() > 0))]",
+            module,
+        )
+        self.assertIn(
+            "#[trusted]\n    #[logic(opaque)]\n    pub fn site_count_model(self) -> Int { pearlite! { 0 } }",
             module,
         )
 
@@ -167,7 +175,11 @@ class EmitStubsTests(unittest.TestCase):
         self.assertIn("impl TreeNode {", module)
         self.assertIn("pub fn child_count(&self) -> usize", module)
         self.assertIn("pub fn is_leaf(&self) -> bool", module)
-        self.assertNotIn("use contracts::creusot", module)
+        # Both queries return modelable Creusot logic types (usize -> Int,
+        # bool -> bool), so their contracts route through generated
+        # *_model() companions, which need logic/trusted/pearlite! in scope.
+        self.assertIn("#[cfg(creusot)]\nuse contracts::creusot::{logic, trusted};", module)
+        self.assertIn("pub fn child_count_model(self) -> Int { pearlite! { 0 } }", module)
         self.assertNotIn("fn attach_child", module)
         self.assertNotIn("impl TreeNode {\n}", module)
 
@@ -218,6 +230,158 @@ class EmitStubsTests(unittest.TestCase):
             )
 
 
+
+
+class TraitEnumConceptKindTests(unittest.TestCase):
+    """Regression coverage for kind='trait'/kind='enum' concepts and the
+    implements mechanism (composition without dyn Trait)."""
+
+    DEMO_ROOT = FIXTURES / "trait_enum_demo"
+
+    def setUp(self) -> None:
+        self._saved_root = emit_stubs.SPECS_SEARCH_ROOT
+        emit_stubs.SPECS_SEARCH_ROOT = self.DEMO_ROOT
+
+    def tearDown(self) -> None:
+        emit_stubs.SPECS_SEARCH_ROOT = self._saved_root
+
+    def _load(self, name: str) -> dict:
+        return json_load(self.DEMO_ROOT / "democrate" / "specs" / f"{name}.json")
+
+    def test_trait_kind_emits_bodyless_declarations_with_model_companion(self):
+        spec = self._load("toggle")
+        methods = emit_stubs.validate_spec(spec)
+        module = emit_stubs.emit_module(spec, methods)
+
+        self.assertIn("pub trait Toggle {", module)
+        # Bodyless, never pub-qualified trait method declarations.
+        self.assertIn("    fn is_on(&self) -> bool;", module)
+        self.assertNotIn("pub fn is_on(&self) -> bool;", module)
+        # bool is a modelable Creusot logic type, so is_on gets a default-bodied
+        # trait model companion instead of degrading the flip postcondition to
+        # a sentinel.
+        self.assertIn(
+            "#[logic(opaque)]\n    fn is_on_model(self) -> bool { pearlite! { true } }",
+            module,
+        )
+        self.assertIn(
+            "#[cfg_attr(creusot, contracts::creusot::ensures((^self).is_on_model() == !(*self).is_on_model()))]",
+            module,
+        )
+        self.assertNotIn("TODO(concept-to-code)", module)
+
+    def test_implements_routes_methods_into_trait_impl_without_contracts(self):
+        spec = self._load("fast_toggle")
+        methods = emit_stubs.validate_spec(spec)
+        module = emit_stubs.emit_module(spec, methods)
+
+        self.assertIn("pub struct FastToggle;", module)
+        self.assertIn("impl Toggle for FastToggle {", module)
+        self.assertIn("    fn is_on(&self) -> bool {", module)
+        self.assertNotIn("pub fn is_on(&self) -> bool {", module)
+        # Creusot checks refinement against the trait's own contract
+        # automatically -- implements-routed methods get no attributes here.
+        self.assertNotIn("cfg_attr(creusot", module)
+        self.assertNotIn("cfg_attr(kani", module)
+
+    def test_enum_kind_emits_closed_enum_with_match_dispatch(self):
+        spec = self._load("any_toggle")
+        methods = emit_stubs.validate_spec(spec)
+        module = emit_stubs.emit_module(spec, methods)
+        props = emit_stubs.emit_props(spec)
+
+        self.assertEqual([], methods)
+        self.assertIn("use democrate::toggle::Toggle as _;", module)
+        self.assertIn("pub enum AnyToggle {", module)
+        self.assertIn("    Fast(FastToggle),", module)
+        self.assertIn("    Slow(SlowToggle),", module)
+        self.assertIn("impl AnyToggle {", module)
+        self.assertIn("        match self {", module)
+        self.assertIn("            AnyToggle::Fast(op) => op.is_on(),", module)
+        self.assertIn("            AnyToggle::Slow(op) => op.is_on(),", module)
+        self.assertIn("            AnyToggle::Fast(op) => op.flip(),", module)
+        self.assertNotIn("dyn Toggle", module)
+        self.assertIn("kind='enum': no local constraints/adversary_table to scaffold.", props)
+        self.assertNotIn("proptest!", props)
+
+
+class KaniF64HarnessTests(unittest.TestCase):
+    """Regression coverage for the hybrid Kani-f64 supplementary verifier
+    (kani_f64_checks), which supplements a Creusot-primary concept when f64
+    sign/finiteness obligations can't be expressed in Pearlite logic."""
+
+    def test_emits_one_proof_harness_per_check(self):
+        spec = json_load(FIXTURES / "kani_f64_demo.json")
+        harness = emit_stubs.emit_kani_f64_harness(spec)
+
+        self.assertIn("#![cfg(kani)]", harness)
+        self.assertIn("#[kani::proof]", harness)
+        self.assertIn("fn kani_f64_rate_scaler_scale_preserves_finite_sign() {", harness)
+        self.assertIn("let rate: f64 = kani::any();", harness)
+        self.assertIn("let factor: f64 = kani::any();", harness)
+        self.assertIn("kani::assume(rate.is_finite());", harness)
+        self.assertIn("let scaled = rate * factor;", harness)
+        self.assertIn("assert!(scaled.is_finite());", harness)
+        self.assertNotIn("kani::should_panic", harness)
+
+    def test_expected_panic_adds_should_panic_attribute(self):
+        spec = json_load(FIXTURES / "kani_f64_demo.json")
+        spec["kani_f64_checks"][0]["expected"] = "panic"
+        harness = emit_stubs.emit_kani_f64_harness(spec)
+
+        self.assertIn("#[kani::should_panic]", harness)
+
+    def test_default_paths_includes_kani_f64_out_and_main_wires_it(self):
+        spec = json_load(FIXTURES / "kani_f64_demo.json")
+        module_out, props_out, kani_f64_out = emit_stubs.default_paths(spec, Path("/tmp/demo-crate"))
+
+        self.assertEqual(kani_f64_out, Path("/tmp/demo-crate/tests/kani_f64_rate_scaler.rs"))
+
+    def test_kani_f64_checks_absent_produces_no_harness(self):
+        spec = json_load(FIXTURES / "example_concept.json")
+        self.assertIsNone(spec.get("kani_f64_checks"))
+
+
+class RewriteStringViewMismatchesForCreusotTests(unittest.TestCase):
+    """Regression tests: `result.<getter>() == <param>` must not compare a
+    borrowed view (`&str`/`Option<&str>`) against an owned constructor
+    parameter (`String`/`Option<String>`), which Creusot's `equal::<T>`
+    rejects as a type mismatch."""
+
+    def setUp(self):
+        self.methods = [
+            emit_stubs.Method("query", "name", "...", "fn name(&self) -> &str"),
+            emit_stubs.Method(
+                "query", "nickname", "...", "fn nickname(&self) -> Option<&str>"
+            ),
+        ]
+        self.new_method = emit_stubs.Method(
+            "command",
+            "new",
+            "...",
+            "fn new(name: String, nickname: Option<String>, age: u32) -> Self",
+        )
+
+    def test_str_getter_vs_owned_string_param_gains_as_str(self):
+        out = emit_stubs.rewrite_string_view_mismatches_for_creusot(
+            "result.name() == name", self.new_method, self.methods
+        )
+
+        self.assertEqual(out, "result.name() == name.as_str()")
+
+    def test_option_str_getter_vs_owned_option_string_param_gains_as_deref(self):
+        out = emit_stubs.rewrite_string_view_mismatches_for_creusot(
+            "result.nickname() == nickname", self.new_method, self.methods
+        )
+
+        self.assertEqual(out, "result.nickname() == nickname.as_deref()")
+
+    def test_non_string_comparison_is_unaffected(self):
+        out = emit_stubs.rewrite_string_view_mismatches_for_creusot(
+            "result.age() == age", self.new_method, self.methods
+        )
+
+        self.assertEqual(out, "result.age() == age")
 
 
 class TranslateLogicToCreusotTests(unittest.TestCase):

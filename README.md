@@ -56,7 +56,9 @@ skill:
 | Setting | Default | Notes |
 |---|---|---|
 | `--crate-dir <path>` | required | Target crate root (containing `src/` and `tests/`) that `emit_stubs.py` writes generated modules and proptest scaffolds into. |
-| `--contracts-crate <name>` | `contracts` | Verifier-contracts facade crate. Must expose `<name>::creusot::*` (Pearlite contract attributes, `creusot_f64_*` model-predicate helpers, and a `creusot::prelude` re-export) and `<name>::verus::prelude::*` (the Verus prelude). See `tests/fixtures/contracts-crate/` for a minimal crate satisfying this shape. |
+| `--contracts-crate <name>` | `contracts` | Verifier-contracts facade crate. Must expose `<name>::creusot::*` (Pearlite contract attributes, `creusot_f64_*` model-predicate helpers, `logic`/`trusted`/`pearlite!` for query logic-model companions, and a `creusot::prelude` re-export) and `<name>::verus::prelude::*` (the Verus prelude). See `tests/fixtures/contracts-crate/` for a minimal crate satisfying this shape. |
+| `--specs-search-root <path>` | parent of `--crate-dir` | Root searched for another crate's spec JSON when resolving a `kind: "struct"` concept's `implements`, or a `kind: "enum"` concept's `trait_ref`/`variants`, as `<root>/<crate>/specs/<snake_case(concept)>.json`. Only matters if a concept uses those fields. |
+| `--kani-f64-out <path>` | `<crate-dir>/tests/kani_f64_<concept>.rs` | Only written when the spec has `kani_f64_checks`. |
 | Findings-report path | project-defined | Where Step A reports are written. One example convention: `findings/<crate>/<concept-kebab>.md` (or, with ticket numbers, `findings/<crate>/T-<id>-<concept-kebab>.md`). |
 | Trace-sidecar path | project-defined, optional | If your project mines invariants from a reference implementation (e.g. via Daikon), point Step A at that sidecar directory. Skip entirely if you have none. |
 | `schemas/spec.schema.json` | bundled | Projects may extend or replace this schema as long as the `$defs` shape (`query`/`command`/`constraint`/`adversary_case`/`source_reference`) is preserved, since `emit_stubs.py` depends on it. |
@@ -96,6 +98,29 @@ skill:
 table) you can run through `emit_stubs.py` to see the generated output before
 trying your own concept.
 
+## Concept kinds and supplementary Kani f64 checks
+
+Every concept so far has been `kind: "struct"` (the default): a concrete
+`pub struct` with an inherent impl. Two more kinds compose concepts without
+`dyn Trait`, which some deductive verifiers (Creusot) cannot verify:
+
+- `kind: "trait"` emits a `pub trait` with contracts on bodyless method
+  declarations. A `kind: "struct"` concept's `implements` field routes named
+  methods into `impl Trait for Concept` instead of the inherent impl.
+- `kind: "enum"` emits a closed `pub enum` wrapping named concrete concepts
+  (`variants`) with a match-dispatched method per method on the trait named
+  by `trait_ref`.
+
+`implements`/`trait_ref`/`variants` reference another concept's spec JSON by
+crate name, resolved under `--specs-search-root`. See
+`tests/fixtures/trait_enum_demo/` for a worked `Toggle` trait plus two
+implementors plus an `AnyToggle` enum composing them.
+
+Separately, a `verifier: "creusot"` concept may add `kani_f64_checks`:
+supplementary implementation-stage Kani harnesses for f64 sign/finiteness
+obligations Creusot logic can't express yet. See
+`tests/fixtures/kani_f64_demo.json`.
+
 ## File map
 
 - `SKILL.md` — skill manifest: triggers, configuration, hard rules, file map,
@@ -115,5 +140,7 @@ trying your own concept.
   unless `SPEC_RUN_{KANI,CREUSOT,VERUS}_SELFTEST=1` and the corresponding
   `cargo-*` tool is on `PATH`).
 - `tests/fixtures/` — fixtures for the above, including
-  `example_concept.json` and a minimal `contracts-crate/` satisfying the
-  `--contracts-crate` facade shape.
+  `example_concept.json`, a minimal `contracts-crate/` satisfying the
+  `--contracts-crate` facade shape, `trait_enum_demo/` (worked `kind:
+  "trait"`/`"enum"`/`implements` example), and `kani_f64_demo.json` (worked
+  `kani_f64_checks` example).

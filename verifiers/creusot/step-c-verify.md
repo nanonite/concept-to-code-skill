@@ -29,6 +29,25 @@ Expected signal: Creusot performs Rust-to-Coma translation and exits without
 contract parse/type errors. `--check` disables output writing and never
 invokes Why3 or SMT solvers.
 
+## Supplementary Kani f64 Gate
+
+If the concept JSON has `kani_f64_checks`, Step B also generated
+`tests/kani_f64_<concept>.rs` (or your project's `--kani-f64-out` path): one
+`#[kani::proof]` harness per check, checking exactly the f64 sign/finiteness
+obligation Creusot's Pearlite logic can't express (check whether your
+Creusot toolchain's `creusot_std` has closed this gap before assuming it's
+still needed — this is a workaround for a specific tooling limitation, not a
+permanent design choice). Run it the same way as any other Kani lean gate:
+
+```bash
+cargo kani -p <crate> --tests --harness kani_f64_<concept>_<check-name> --only-codegen
+```
+
+Expected signal: the harness compiles and, for `--only-codegen`, no CBMC/SAT
+run happens yet. Run without `--only-codegen` (optionally resource-capped,
+see `docs/spec-first-workflow.md`) once the concept's implementation lands,
+alongside the concept's own Creusot full verification.
+
 ## Full Verification
 
 Full Creusot verification is reserved for selected critical methods after
