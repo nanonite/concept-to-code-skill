@@ -153,8 +153,11 @@ class EmitStubsTests(unittest.TestCase):
         methods = emit_stubs.validate_spec(concept)
         module = emit_stubs.emit_module(concept, methods)
 
+        # site_count returns usize (modelable), so the constructor's
+        # postcondition routes through Pearlite's match-result form and the
+        # site_count_model() companion instead of degrading to a sentinel.
         self.assertIn(
-            "#[cfg_attr(creusot, contracts::creusot::ensures(true /* TODO(concept-to-code): generated query method needs Pearlite model helper */))]",
+            "#[cfg_attr(creusot, contracts::creusot::ensures(match result { Ok(ok_result) => ok_result.site_count_model() > 0, Err(_) => true }))]",
             module,
         )
 
@@ -382,6 +385,104 @@ class RewriteStringViewMismatchesForCreusotTests(unittest.TestCase):
         )
 
         self.assertEqual(out, "result.age() == age")
+
+
+class CreusotResultAndForallUpstreamFixTests(unittest.TestCase):
+    """Regression coverage for a second wave of generic Creusot/Verus fixes
+    found upstream in the beast-rs fork after this repo's first port pass."""
+
+    def test_constraint_in_scope_binds_result_for_non_result_returning_self_method(self):
+        # Creusot's ensures binds the return value as `result` for every
+        # return type, not just Result<_, _> -- a &self method returning a
+        # plain bool/usize/etc. can still reference `result` in scope.
+        method = emit_stubs.Method(
+            "query", "is_valid", "...", "fn is_valid(&self) -> bool"
+        )
+        self.assertTrue(
+            emit_stubs.creusot_constraint_in_scope("result == self.is_valid()", method)
+        )
+
+    def test_free_identifiers_ignores_words_inside_comments(self):
+        out = emit_stubs.creusot_free_identifiers(
+            "self.count() > 0 /* stray_word should not count as free */"
+        )
+        self.assertNotIn("stray_word", out)
+        self.assertNotIn("should", out)
+
+    def test_verus_sum_does_not_false_positive_on_longer_identifier(self):
+        # `.find("sum(")` would incorrectly match inside `checksum(...)`.
+        out = emit_stubs.translate_logic_to_verus("checksum(0) >= 0")
+        self.assertEqual(out, "checksum(0) >= 0")
+
+    def test_verus_product_does_not_false_positive_on_longer_identifier(self):
+        out = emit_stubs.translate_logic_to_verus("byproduct(0) >= 0")
+        self.assertEqual(out, "byproduct(0) >= 0")
+
+    def test_result_returning_constructor_postcondition_uses_match_form(self):
+        # A self-less Result-returning constructor's postcondition must not
+        # emit `result.as_ref().unwrap().<method>()` -- Creusot rejects
+        # as_ref/unwrap in logic context. It must use Pearlite's match form.
+        method = emit_stubs.Method(
+            "command", "new", "...", "fn new() -> Result<Self, BuildError>"
+        )
+        rewritten = emit_stubs.rewrite_static_self_for_creusot(
+            "self.count() > 0", method
+        )
+        self.assertEqual(
+            rewritten,
+            "match result { Ok(ok_result) => ok_result.count() > 0, Err(_) => true }",
+        )
+        self.assertNotIn("as_ref", rewritten)
+        self.assertNotIn("unwrap", rewritten)
+
+    def test_query_calls_reroute_through_ok_result_receiver(self):
+        rerouted = emit_stubs._replace_query_calls(
+            "match result { Ok(ok_result) => ok_result.count() > 0, Err(_) => true }",
+            {"count": "count_model"},
+        )
+        self.assertEqual(
+            rerouted,
+            "match result { Ok(ok_result) => ok_result.count_model() > 0, Err(_) => true }",
+        )
+
+    def test_bare_param_len_becomes_seq_view(self):
+        out = emit_stubs._model_creusot_usize_calls("values.len()@ > 0")
+        self.assertEqual(out, "values@.len() > 0")
+
+    def test_self_and_result_len_are_unaffected_by_seq_view_rewrite(self):
+        out = emit_stubs._model_creusot_usize_calls("self.len()@ > 0")
+        self.assertEqual(out, "self.len()@ > 0")
+
+    def test_verus_bare_slice_index_gets_int_cast(self):
+        out = emit_stubs.translate_logic_to_verus("values[pattern] >= 0.0")
+        self.assertIn("values[(pattern) as int]", out)
+
+    def test_verus_quantified_slice_index_is_not_double_cast(self):
+        # "i" is bound by the forall (already `int`-typed in Verus), so the
+        # bare-slice-index cast must leave it alone rather than wrapping an
+        # already-correct quantified index in a redundant `as int`.
+        out = emit_stubs.translate_logic_to_verus(
+            "forall i in 0..values.len(): values[i] >= 0.0"
+        )
+        self.assertIn("values[i]", out)
+        self.assertNotIn("values[(i) as int]", out)
+
+    def test_bare_forall_without_range_translates_to_pearlite_quantifier(self):
+        out = emit_stubs.translate_logic_to_creusot(
+            "forall label: self.contains(label) == self.contains(label)"
+        )
+        self.assertEqual(
+            out, "forall<label> self.contains(label) == self.contains(label)"
+        )
+        self.assertNotIn("TODO(concept-to-code)", out)
+
+    def test_is_some_becomes_pearlite_none_comparison(self):
+        out = emit_stubs.translate_logic_to_creusot("self.nickname().is_some()")
+        self.assertEqual(out, "(self.nickname() != None)")
+
+    def test_is_none_becomes_pearlite_none_comparison(self):
+        out = emit_stubs.translate_logic_to_creusot("self.nickname().is_none()")
+        self.assertEqual(out, "(self.nickname() == None)")
 
 
 class TranslateLogicToCreusotTests(unittest.TestCase):

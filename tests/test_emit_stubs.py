@@ -11,6 +11,7 @@ if str(TEST_DIR) not in sys.path:
 
 try:
     from tests.emit_stubs_test import (
+        CreusotResultAndForallUpstreamFixTests,
         EmitStubsTests,
         KaniF64HarnessTests,
         RewriteStringViewMismatchesForCreusotTests,
@@ -20,6 +21,7 @@ try:
     )
 except ModuleNotFoundError:
     from emit_stubs_test import (
+        CreusotResultAndForallUpstreamFixTests,
         EmitStubsTests,
         KaniF64HarnessTests,
         RewriteStringViewMismatchesForCreusotTests,
@@ -29,6 +31,7 @@ except ModuleNotFoundError:
     )
 
 __all__ = [
+    "CreusotResultAndForallUpstreamFixTests",
     "EmitStubsTests",
     "KaniF64HarnessTests",
     "RewriteStringViewMismatchesForCreusotTests",

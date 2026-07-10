@@ -339,6 +339,44 @@ def _suffix_verus_float_literals(expr: str) -> str:
     return re.sub(r"(?<![A-Za-z0-9_])(\d+\.\d+)(?![A-Za-z0-9_])", r"\1f64", expr)
 
 
+_INT_CLOSURE_PARAM_RE = re.compile(r"\|\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*int\s*\|")
+
+
+def _cast_bare_slice_index_to_int(expr: str, quantified: list[str]) -> str:
+    """Cast a bare (non-quantified) identifier used as a whole slice index to
+    `int`, e.g. `values[pattern]` -> `values[(pattern) as int]`.
+
+    Verus's `Seq::spec_index` requires an `int` argument. A compound index
+    expression that already mixes in a quantified `int` variable (e.g.
+    `values[m * n + pattern]`) type-checks via Verus's arithmetic promotion
+    once an `int` operand is present, but a bare `usize`-typed identifier
+    used alone as the entire index has nothing to promote it, so it needs an
+    explicit cast.
+
+    Skips identifiers already known to be `int`: those in `quantified` (the
+    caller's own nesting depth) plus any `|name: int|` closure parameter
+    already present in `expr` -- the latter matters because this function
+    also runs on the *outer* string after `_replace_sums`/`_replace_products`/
+    `_replace_foralls` have already spliced in fully translated inner
+    closures; at that point `quantified` no longer describes those inner
+    closures' bound variables, so without rescanning the text itself a
+    variable like `s` in an already-correct `|s: int| ...values[s]...` would
+    be misidentified as an untouched bare `usize` and incorrectly re-cast.
+    Also skips `out`, which this module's own `_cast_quantified_refs` already
+    rewrites to `out@[...]` (a different, dedicated convention for the
+    generated output-buffer parameter)."""
+    protected = set(quantified)
+    protected.update(_INT_CLOSURE_PARAM_RE.findall(expr))
+
+    def cast(match: re.Match[str]) -> str:
+        name, index = match.group(1), match.group(2)
+        if name == "out" or index in protected:
+            return match.group(0)
+        return f"{name}[({index}) as int]"
+
+    return re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*)\[([A-Za-z_][A-Za-z0-9_]*)\]", cast, expr)
+
+
 def _use_final_mut_refs(expr: str, refs: Iterable[str]) -> str:
     out = expr
     for name in refs:
@@ -427,7 +465,8 @@ def _replace_abs(expr: str, quantified: list[str], query_spec_map: dict[str, str
 def _replace_sums(expr: str, quantified: list[str], query_spec_map: dict[str, str] | None = None) -> str:
     out = expr
     while True:
-        start = out.find("sum(")
+        _sum_match = re.search(r"(?<![A-Za-z0-9_])sum\(", out)
+        start = _sum_match.start() if _sum_match else -1
         if start < 0:
             return out
         open_index = start + len("sum")
@@ -457,7 +496,8 @@ def _replace_sums(expr: str, quantified: list[str], query_spec_map: dict[str, st
 def _replace_products(expr: str, quantified: list[str], query_spec_map: dict[str, str] | None = None) -> str:
     out = expr
     while True:
-        start = out.find("product(")
+        _product_match = re.search(r"(?<![A-Za-z0-9_])product\(", out)
+        start = _product_match.start() if _product_match else -1
         if start < 0:
             return out
         open_index = start + len("product")
@@ -631,6 +671,7 @@ def _translate_verus_expr(expr: str, quantified: list[str], final_mut_refs: Iter
     out = _replace_products(out, quantified, query_spec_map)
     out = _replace_foralls(out, quantified, query_spec_map)
     out = _cast_quantified_refs(out, quantified, query_spec_map)
+    out = _cast_bare_slice_index_to_int(out, quantified)
     out = _use_final_mut_refs(out, final_mut_refs)
     out = _replace_query_calls(out, query_spec_map or {})
     out = _replace_f64_is_finite(out)
@@ -684,26 +725,58 @@ def rust_signature_with_named_result(signature: str) -> str:
     return f"{prefix} -> (result: {ret_ty})"
 
 
+def _parse_bare_creusot_quantifier_clause(clause: str) -> tuple[list[str], str]:
+    """Parse a bare `forall <vars>: BODY` clause (no `in 0..` range).
+
+    Returns (vars_, body). Used by `_replace_creusot_forall` when the range
+    form is absent, e.g. `forall label: self.contains(label) == ...` --
+    quantifying over a domain value rather than an index range.
+    """
+    colon = _find_top_level(clause, ":")
+    if colon < 0:
+        raise SpecError(f"bare forall clause missing ':' in Creusot logic: {clause}")
+    head = clause[:colon].strip()
+    body = clause[colon + 1 :].strip()
+    where_idx = _find_top_level(head, " where ")
+    if where_idx >= 0:
+        head = head[:where_idx].strip()
+    vars_ = [var.strip() for var in head.split(",") if var.strip()]
+    if not vars_:
+        raise SpecError(f"bare forall clause has no binders: {clause}")
+    for var in vars_:
+        if not re.fullmatch(r"[A-Za-z_]\w*", var):
+            raise SpecError(f"bare forall binder is not a plain identifier: {var!r}")
+    return vars_, body
+
+
 def _replace_creusot_forall(src: str) -> str:
     match = re.search(r"\bforall\b", src)
     if not match:
         return src
     prefix = src[: match.start()]
     clause = src[match.end() :].strip()
+    antecedent: str | None
     try:
         vars_, end_expr, guard, body = _parse_range_clause(clause)
+        bounds: list[str] = []
+        for var in vars_:
+            bounds.extend([f"0 <= {var}", f"{var} < {end_expr}"])
+        if guard:
+            bounds.append(guard)
+        antecedent = " && ".join(bounds)
     except SpecError:
-        return "true /* TODO(concept-to-code): unsupported forall clause needs Pearlite translation */"
-    bounds: list[str] = []
-    for var in vars_:
-        bounds.extend([f"0 <= {var}", f"{var} < {end_expr}"])
-    if guard:
-        bounds.append(guard)
-    antecedent = " && ".join(bounds)
+        try:
+            vars_, body = _parse_bare_creusot_quantifier_clause(clause)
+        except SpecError:
+            return "true /* TODO(concept-to-code): unsupported forall clause needs Pearlite translation */"
+        antecedent = None
     if re.search(r"\bforall\b|\bAND\b|\bOR\b", body):
         return "true /* TODO(concept-to-code): unsupported forall clause needs Pearlite translation */"
     params = ", ".join(vars_)
-    replacement = f"forall<{params}> {antecedent} ==> {body}"
+    if antecedent is not None:
+        replacement = f"forall<{params}> {antecedent} ==> {body}"
+    else:
+        replacement = f"forall<{params}> {body}"
     return f"{prefix}{replacement}"
 
 
@@ -841,6 +914,8 @@ def _creusot_domain_index_param_names(method: Method) -> frozenset[str]:
 
 
 def creusot_free_identifiers(logic: str) -> set[str]:
+    logic = re.sub(r"/\*.*?\*/", " ", logic, flags=re.DOTALL)
+    logic = re.sub(r"//.*", " ", logic)
     free: set[str] = set()
     for match in re.finditer(r"\b[A-Za-z_]\w*\b", logic):
         token = match.group(0)
@@ -890,10 +965,10 @@ def creusot_constraint_in_scope(logic: str, method: Method) -> bool:
     scope = method_arg_names(method)
     if method_has_self(method):
         scope.add("self")
-    if method_returns_result(method) or not method_has_self(method):
-        # rewrite_static_self_for_creusot rewrites `self.` -> `result.` for
-        # every self-less method, not just Result-returning ones.
-        scope.add("result")
+    # Creusot ensures bind the return value as `result` for all return
+    # types, including plain values returned from &self / &mut self methods
+    # (#531) -- not just Result-returning or self-less methods.
+    scope.add("result")
     for binder in re.findall(r"\b(?:Ok|Some)\((\w+)\)", logic):
         scope.add(binder)
     scope |= creusot_quantifier_bound_vars(logic)
@@ -911,6 +986,17 @@ def _model_creusot_usize_calls(src: str) -> str:
 
     pattern = r"(?:\b[A-Za-z_]\w*(?:\.[A-Za-z_]\w*\([^()]*\))*\.)?(?P<name>[A-Za-z_]\w*)\([^()]*\)(?!@)"
     out = re.sub(pattern, repl, src)
+    # A bare-identifier parameter's `.len()` (e.g. a `Vec<T>`/`&[T]` param)
+    # must become `param@.len()` (Seq view's len), not `param.len()@` (program
+    # Vec::len/slice::len with @ on the returned usize) -- Creusot rejects
+    # Vec::len/slice::len in logic context; Seq::len on the mathematical view
+    # is valid Pearlite. Only applies to bare receivers, not self/result/
+    # ok_result, which are already rerouted to model companions above.
+    out = re.sub(
+        r"\b([A-Za-z_]\w*)\.(\w+)\(\)@",
+        lambda m: f"{m.group(1)}@.{m.group(2)}()" if m.group(1) not in {"self", "result", "ok_result"} else m.group(0),
+        out,
+    )
     out = out.replace("old(self.staged_mutation_count()@)", "old(self.staged_mutation_count())@")
     out = re.sub(r"\bROOT_PARENT_SENTINEL\b(?!@)", "ROOT_PARENT_SENTINEL@", out)
     out = re.sub(r"\bTAXON_LABEL_MAX_LEN\b(?!@)", "TAXON_LABEL_MAX_LEN@", out)
@@ -964,7 +1050,37 @@ def _replace_creusot_f64_comparisons(src: str) -> str:
 def rewrite_result_methods_for_creusot(logic: str, method: Method) -> str:
     if not method_returns_result(method):
         return logic
-    if not re.search(r"\bresult\.(?!is_ok\(|is_err\(|as_ref\(|unwrap\(|expect\()\w+\(", logic):
+    # Rewrite `result.as_ref().unwrap().<expr>` (which Creusot rejects in logic
+    # context -- as_ref/unwrap are program functions, not logic functions) to
+    # Pearlite's match form: `match result { Ok(ok_result) => <expr with
+    # ok_result.>, Err(_) => true }`. Also strips a leading `result.is_ok()
+    # ==>` guard since the match already handles the Err case.
+    if re.search(r"\bresult\.as_ref\(\)\.unwrap\(\)\.", logic):
+        body = re.sub(r"\bresult\.as_ref\(\)\.unwrap\(\)\.", "ok_result.", logic)
+        body = re.sub(r"^result\.is_ok\(\)\s*==>\s*", "", body)
+        return f"match result {{ Ok(ok_result) => {body}, Err(_) => true }}"
+    # Rewrite bare `result.is_ok() ==> <body>` and `result.is_err() ==> <body>`
+    # guards to match form, since is_ok/is_err are program functions rejected
+    # by Creusot in logic context.
+    is_ok_match = re.search(r"^result\.is_ok\(\)\s*==>\s*(.+)$", logic)
+    if is_ok_match:
+        return f"match result {{ Ok(_) => {is_ok_match.group(1)}, Err(_) => true }}"
+    is_err_match = re.search(r"^result\.is_err\(\)\s*==>\s*(.+)$", logic)
+    if is_err_match:
+        return f"match result {{ Ok(_) => true, Err(_) => {is_err_match.group(1)} }}"
+    # Rewrite bare result.is_ok()/is_err() calls appearing inside a larger
+    # expression (equality, conjunction, ...) to match-expression form too.
+    logic = re.sub(
+        r"\bresult\.is_ok\(\)",
+        "(match result { Ok(_) => true, Err(_) => false })",
+        logic,
+    )
+    logic = re.sub(
+        r"\bresult\.is_err\(\)",
+        "(match result { Ok(_) => false, Err(_) => true })",
+        logic,
+    )
+    if not re.search(r"\bresult\.(?!as_ref\(|unwrap\(|expect\()\w+\(", logic):
         return logic
     rewritten = re.sub(r"\bresult\.", "ok_result.", logic)
     return f"match result {{ Ok(ok_result) => {rewritten}, Err(_) => true }}"
@@ -1144,13 +1260,17 @@ def emit_creusot_chain_model_companion(
 
 
 def _replace_chain_calls(expr: str, chain_map: dict[tuple[str, str], str]) -> str:
-    """Rewrite `self.<q>(args).<term>()` -> `self.<q>_<term>_model(args)` (#349)."""
+    """Rewrite `self.<q>(args).<term>()` -> `self.<q>_<term>_model(args)` (#349).
+
+    Also handles `ok_result.<q>(args).<term>()`, the receiver
+    `rewrite_static_self_for_creusot`'s match-result form produces for
+    self-less Result-returning constructors."""
     out = expr
     for (q, term), model_name in sorted(
         chain_map.items(), key=lambda kv: len(kv[0][0]), reverse=True
     ):
         out = re.sub(
-            rf"\b(self|result|old\(self\)|final\(self\))\.{re.escape(q)}\(([^()]*)\)\.{re.escape(term)}\(\)",
+            rf"\b(self|result|old\(self\)|final\(self\)|ok_result)\.{re.escape(q)}\(([^()]*)\)\.{re.escape(term)}\(\)",
             rf"\1.{model_name}(\2)",
             out,
         )
@@ -1177,6 +1297,21 @@ def _replace_creusot_option_f64_equalities(src: str, names: set[str]) -> str:
     return re.sub(rf"(?<![\w.])({atom})\s*(==|!=)\s*({atom})", repl, src)
 
 
+def _replace_creusot_option_predicates(src: str) -> str:
+    """Rewrite `expr.is_some()`/`expr.is_none()` to `expr != None`/`expr == None`.
+
+    Pearlite's `Option::is_some`/`is_none` are program methods, not logic
+    functions; calling them in a contract triggers the unmodeled-call
+    sentinel. `Option<Int>` (and `Option<f64>` after the opaque-helper path)
+    supports direct `==`/`!=` against `None` in Pearlite, so this rewrite
+    keeps the constraint semantic without an extra helper.
+    """
+    atom = r"[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*(?:\.[A-Za-z_]\w*\([^()]*\))*"
+    src = re.sub(rf"\b({atom})\.is_some\(\)", r"(\1 != None)", src)
+    src = re.sub(rf"\b({atom})\.is_none\(\)", r"(\1 == None)", src)
+    return src
+
+
 def translate_logic_to_creusot(logic: str) -> str:
     """Translate restricted-English `logic` to Pearlite-compatible syntax.
 
@@ -1194,6 +1329,7 @@ def translate_logic_to_creusot(logic: str) -> str:
     if re.search(r"\bforall\b", src):
         return _replace_creusot_forall(src)
     src = re.sub(r"\bimplies\b", "==>", src)
+    src = _replace_creusot_option_predicates(src)
     src = _replace_creusot_f64_predicates(src)
     src = _replace_creusot_f64_comparisons(src)
     src = _model_creusot_usize_calls(src)
@@ -1204,8 +1340,14 @@ def rewrite_static_self_for_creusot(logic: str, method: Method) -> str:
     if method_has_self(method) or not re.search(r"\bself\.", logic):
         return logic
     if method_returns_result(method):
-        rewritten = re.sub(r"\bself\.", "result.as_ref().unwrap().", logic)
-        return f"result.is_ok() ==> {rewritten}"
+        # Creusot rejects `result.as_ref().unwrap().<method>()` in logic
+        # context (as_ref/unwrap are program functions). Use Pearlite's match
+        # form instead: `match result { Ok(ok_result) => <body>, Err(_) =>
+        # true }`. The `ok_result.` receiver is then rerouted to model
+        # companions by the standard _replace_query_calls/_replace_chain_calls
+        # pipeline.
+        rewritten = re.sub(r"\bself\.", "ok_result.", logic)
+        return f"match result {{ Ok(ok_result) => {rewritten}, Err(_) => true }}"
     return re.sub(r"\bself\.", "result.", logic)
 
 
@@ -1396,9 +1538,13 @@ def emit_verus_query_len_spec_companion(lines: list[str], method: Method, spec_n
 
 
 def _replace_query_calls(expr: str, query_spec_map: dict[str, str]) -> str:
+    """Reroute `self|result|old(self)|final(self)|ok_result.<q>(` to its model.
+
+    `ok_result` is the receiver `rewrite_static_self_for_creusot`'s
+    match-result form produces for self-less Result-returning constructors."""
     out = expr
     for query_name, spec_name in sorted(query_spec_map.items(), key=lambda item: len(item[0]), reverse=True):
-        out = re.sub(rf"\b(self|old\(self\)|final\(self\)|result)\.{re.escape(query_name)}\(", rf"\1.{spec_name}(", out)
+        out = re.sub(rf"\b(self|old\(self\)|final\(self\)|result|ok_result)\.{re.escape(query_name)}\(", rf"\1.{spec_name}(", out)
     return out
 
 

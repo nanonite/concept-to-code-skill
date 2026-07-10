@@ -1,7 +1,9 @@
 # Upstream port plan — model companions, hybrid Kani-f64 verifier, trait/enum concept-kinds
 
-**Status:** Plan only. Nothing in this repo has been changed yet. Written
-2026-07-05 for a dedicated session to execute against.
+**Status:** Phases 0-3 implemented and landed (commit `0bf9366`, 2026-07-06).
+A second fork-drift review and follow-up bug-fix pass landed 2026-07-09 (see
+addendum at the end of this file). Originally written 2026-07-05 for a
+dedicated session to execute against.
 
 **Source of truth for everything below:** `/home/goya/beast-workspace/workspace`,
 specifically `skills/beast-rs-spec-first/emit_stubs.py` (2455 lines) and
@@ -387,3 +389,100 @@ bundled into this one:
   cross-crate resolution mechanism (see "Required generalization work" above)
   should not reuse this exact constant, even though phase 2 needs something
   that plays a similar role.
+
+## Addendum (2026-07-09): second fork-drift review and follow-up fix pass
+
+The beast-rs fork kept moving after the first port pass landed (`0bf9366`).
+Six more commits touched `emit_stubs.py` on the fork between the first
+pass's `a9ce760` reference point and this review (`d3a17ba`, current HEAD at
+review time). Triaged each the same way as the first pass — porting generic
+correctness fixes to the exact model-companion/forall machinery already
+ported, leaving out anything beast-rs-domain-specific or not yet
+generalizable.
+
+**Ported this pass** (all generic bugs in code this repo already carries,
+none beast-rs-domain-specific):
+
+1. `creusot_constraint_in_scope` now adds `"result"` to scope
+   unconditionally, not just for `Result`-returning or self-less methods —
+   Creusot's `ensures` binds the return value as `result` for every return
+   type (fork `#531`).
+2. `creusot_free_identifiers` strips `/* ... */` and `//` comments before
+   scanning for free identifiers (same fork `#531` commit).
+3. Verus `_replace_sums`/`_replace_products` now use a word-boundary-aware
+   regex instead of `str.find("sum("` / `.find("product("`, which
+   false-matched inside longer identifiers like `checksum(...)`.
+4. **The consequential one**: `rewrite_static_self_for_creusot` and
+   `rewrite_result_methods_for_creusot` no longer rewrite a self-less
+   `Result`-returning constructor's postcondition to
+   `result.as_ref().unwrap().foo()` — Creusot rejects `as_ref`/`unwrap` in
+   logic context. Both now emit Pearlite's `match result { Ok(ok_result) =>
+   ..., Err(_) => true }` form instead. This was silently forcing every
+   Result-returning constructor's query-based constraints to the
+   `TODO(#347)`-style sentinel in the first port pass instead of real
+   Pearlite — exactly the case Phase 1's model companions were supposed to
+   unlock. Required also extending `_replace_query_calls`/
+   `_replace_chain_calls`'s receiver alternation to recognize `ok_result`,
+   or the match-form rewrite alone would still leave the query call
+   unrerouted and hit the sentinel anyway (caught by tracing the fix
+   through by hand before applying it, not by the upstream diff alone).
+5. `_model_creusot_usize_calls`: a bare-identifier `Vec`/slice parameter's
+   `.len()` now becomes `param@.len()` (Seq view), not `param.len()@`
+   (rejected program call) — `self`/`result`/`ok_result` receivers are
+   excluded since those are already rerouted to model companions earlier in
+   the pipeline.
+6. Verus: a bare (non-quantified) identifier used alone as a whole slice
+   index now gets an explicit `as int` cast (`_cast_bare_slice_index_to_int`)
+   — `Seq::spec_index` requires it; only a *compound* index expression
+   already containing a quantified `int` operand type-checks via arithmetic
+   promotion without one.
+7. `_replace_creusot_forall` now supports a bare `forall <vars>: BODY` clause
+   with no `in 0..` range (e.g. quantifying over a domain value rather than
+   an index), falling back to the existing range-clause parser first and
+   only using the bare form when that fails. Ported as a minimal addition to
+   this repo's own pre-existing (already-diverged-from-beast-rs) untyped
+   `forall<vars>` convention, not a wholesale copy of beast-rs's own
+   `Int`-typed/AND-OR-substituting version of this function.
+8. `.is_some()`/`.is_none()` now rewrite to `!= None`/`== None` in Pearlite
+   (`_replace_creusot_option_predicates`) instead of hitting the
+   unmodeled-call sentinel — `Option::is_some`/`is_none` are program
+   methods, not logic functions, but direct `None` comparison is valid
+   Pearlite.
+
+All 8 are covered by `CreusotResultAndForallUpstreamFixTests` in
+`tests/emit_stubs_test.py`, plus the pre-existing
+`test_creusot_static_result_constructor_rewrites_self_to_result` updated to
+assert the new match-form output instead of the old sentinel.
+
+**New feature found, not ported — needs generalization first**:
+`structural_opt_out` (fork `#513`), a whole-concept "this is definitionally
+outside what any verifier can prove" escape hatch (for runtime-wiring/
+dispatch/orchestration/live-UI-state concepts). Genuinely useful shape, but
+its schema is deep beast-rs plumbing as committed: a fixed `category` enum
+tied to beast-rs's own crate layout, a `tracking_issue` field requiring the
+literal pattern `^chainlink:[0-9]+$`, and an `architectural_alternative_
+considered` field whose own description references beast-rs's
+`dyn-trait-creusot-ice-plan.md` by name. Would need a project-agnostic
+category taxonomy and tracking-reference pattern before it's portable —
+scope as a separate pass if wanted.
+
+**Correctly left out (beast-rs-domain-specific, not generalizable as
+committed)**: `creusot_param_chain_model_companions` /
+`emit_creusot_param_chain_model_companion` / `_replace_param_indexed_chain_calls`
+(param-indexed chain models for `<param>[i].<term>()`, e.g. `taxa[i].label()`
+— even upstream's own version has a hardcoded `Vec<crate::taxon::Taxon>`
+fallback type baked in, a code smell in the fork itself); the `"label"`
+chain-terminal vocabulary added to `CREUSOT_USIZE_MODEL_CALLS`; the
+RootLikelihoodIntegrator spec JSONs (pure beast-rs domain content, not
+generator code); `verifier_override_justification`'s updated description
+(this repo has no such field — beast-rs's own ADR-0001 crate-to-verifier
+defaults don't apply here).
+
+**Also noted, pre-existing, out of scope for this pass**: `_model_creusot_
+usize_calls` in this repo already carried several hardcoded beast-rs-domain
+literals (`ROOT_PARENT_SENTINEL`, `TAXON_LABEL_MAX_LEN`, and the
+special-cased `index`/`node` parameter names) from concept-to-code's
+*original* extraction from beast-rs, predating this port entirely. Not
+introduced by either port pass — flagged here as latent generalization debt
+worth a dedicated cleanup pass, not fixed opportunistically alongside
+unrelated work.
