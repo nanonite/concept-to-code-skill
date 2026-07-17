@@ -154,6 +154,31 @@
       },
       "description": "Optional list of Rust use-paths to emit at the top of the generated stub module. Use this when a constraint logic expression or a constructor signature references types/constants/functions that live in a sibling support module (e.g. forward-referenced error types, named constants used in invariants, helper predicates like is_nfc). Each entry is the path portion of a `use` statement: e.g. \"crate::string_support::*\" emits `use crate::string_support::*;`."
     },
+    "depends_on": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["crate", "concept", "reason"],
+        "properties": {
+          "crate": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*$",
+            "description": "Crate the depended-on concept lives in, resolved under --specs-search-root as <crate>/specs/<snake_case(concept)>.json (same convention as implements/trait_ref)."
+          },
+          "concept": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Za-z0-9]*$"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 10,
+            "description": "Why this concept depends on the named one, in restricted English -- e.g. \"assumes TaxonSet's index ordering is stable across mutation\" or \"adversary_table row 3 mirrors AlignmentColumn's own gap-handling contract\". Not just a citation: state the actual assumption, so a reviewer changing the depended-on concept can tell whether this one needs re-review without reading its full spec."
+          }
+        }
+      },
+      "description": "Optional, purely declarative. Semantic dependencies on other concepts not already captured by implements/trait_ref/variants or supplementary_imports -- e.g. a constraint's logic implicitly assumes an invariant another concept establishes, or an adversary_table row exists specifically because of another concept's behavior. Nothing in emit_stubs.py enforces or checks these edges against generated code; they exist so spec_workspace.py's `impact`/`graph` commands can compute what else to review when a concept's shape changes. Prefer implements/trait_ref/variants when the relationship is already expressible there -- this field is for dependencies with no other structural home."
+    },
     "kani_f64_checks": {
       "type": "array",
       "minItems": 1,

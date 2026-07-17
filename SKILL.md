@@ -82,6 +82,38 @@ before reaching for it). Presence generates `tests/kani_f64_<concept>.rs` via
 `--kani-f64-out` (default path from `default_paths`). See
 `tests/fixtures/kani_f64_demo.json` for a worked example.
 
+## Concept dependencies and workspace tooling
+
+Cross-concept relationships are otherwise invisible to tooling — `implements`/
+`trait_ref`/`variants` are resolved once, at generation time, for the one
+concept being built, with no reverse index and no way to ask "what else
+needs review if I change this concept's shape." An optional `depends_on:
+[{crate, concept, reason}]` field records a *semantic* dependency with no
+other structural home (e.g. a constraint implicitly assumes an invariant
+another concept establishes) — purely declarative, not consumed by
+`emit_stubs.py` itself.
+
+`spec_workspace.py` is the workspace-level companion to `emit_stubs.py`: it
+walks every spec JSON under `--specs-search-root` and can:
+
+- `discover` — list every concept, its generation state (`PENDING`/`STUB`/
+  `IMPLEMENTED`), and its dependency edges (`implements`/`trait_ref`/
+  `variant`/`depends_on`).
+- `impact <crate>::<Concept>` — print every concept that depends on the
+  given one, directly or transitively, so a change's blast radius is a
+  command instead of a memory exercise.
+- `graph` — dump the full dependency graph.
+- `check` — regenerate every concept to a temp dir and byte-diff against the
+  committed output; fails on drift (hand-edited or stale generated files).
+- `verify-lean` / `verify-full` — dispatch the selected verifier per
+  concept, **skipping any concept whose generated body still contains
+  `unimplemented!()` under `verify-full`** (see Hard Rules below).
+
+Run `spec_workspace.py discover` and `spec_workspace.py impact <key>` before
+adding a concept that composes with existing ones, and add a `depends_on`
+entry (with a real `reason`, not just a citation) whenever a constraint's
+correctness silently leans on another concept's behavior.
+
 ## Hard Rules
 
 - During Step A, do not propose Rust declaration vocabulary until the
@@ -94,8 +126,16 @@ before reaching for it). Presence generates `tests/kani_f64_<concept>.rs` via
   `()`, or if any query has `pure: false`.
 - Generated Rustdoc must copy English text from the JSON spec verbatim.
 - Generated stubs must keep bodies as `unimplemented!()` until Step C reports
-  contract well-formedness.
+  contract well-formedness. This is a prose rule for you to follow during the
+  conversation, **and** a mechanically checked one: `spec_workspace.py
+  verify-full` refuses to run full verification against any concept whose
+  generated source still contains `unimplemented!()`, printing `SKIP
+  <concept>: unimplemented body` instead of silently attempting it (or
+  worse, silently passing because there was nothing left to disprove).
 - Do not hand-edit generated stubs. Regenerate from JSON.
+  `spec_workspace.py check` mechanically enforces this too: it regenerates
+  every concept to a temp dir and fails the moment a byte differs from the
+  committed file.
 
 ## Files
 
@@ -111,6 +151,9 @@ before reaching for it). Presence generates `tests/kani_f64_<concept>.rs` via
 - `verifiers/{kani,creusot,verus}/contracts.md`: contract-pattern reference
   for each verifier.
 - `emit_stubs.py`: deterministic JSON-to-Rust stub generator.
+- `spec_workspace.py`: workspace-wide discovery, dependency-impact analysis,
+  drift-check, and gated verifier dispatch across every spec under
+  `--specs-search-root`.
 - `schemas/spec.schema.json`: bundled generic concept schema.
 - `docs/spec-first-workflow.md`: the 6-step workflow this skill follows.
 - `tests/fixtures/trait_enum_demo/`: worked `kind: "trait"`/`kind: "enum"`/
@@ -119,9 +162,14 @@ before reaching for it). Presence generates `tests/kani_f64_<concept>.rs` via
 
 ## Recommended Flow
 
-1. Read `schemas/spec.schema.json` and `docs/spec-first-workflow.md`.
+1. Read `schemas/spec.schema.json` and `docs/spec-first-workflow.md`. If this
+   concept composes with existing ones (via `implements`/`trait_ref` or an
+   assumed `depends_on` relationship), run `spec_workspace.py discover` and
+   `spec_workspace.py impact <crate>::<Concept>` on anything it will depend
+   on first, to see what's already there and what else might need review.
 2. Follow `prompts/step-a-coanalysis.md` to produce `<concept>.json` or repair
-   an existing spec.
+   an existing spec. Add a `depends_on` entry for any semantic dependency not
+   already captured by `implements`/`trait_ref`/`variants`.
 3. Follow `prompts/step-b-skeleton.md` to run `emit_stubs.py`.
 4. Read `verifier` from the concept JSON and dispatch Step C:
    - `kani` -> follow `verifiers/kani/step-c-verify.md`.
@@ -130,3 +178,8 @@ before reaching for it). Presence generates `tests/kani_f64_<concept>.rs` via
 5. Report the selected verifier lean-gate signal: contracts are well formed
    and verifier startup/typechecking reaches the unimplemented stubs without
    parser errors.
+6. Periodically (e.g. before a PR), run `spec_workspace.py check` to catch
+   drift between committed generated files and what the spec would produce
+   today, and `spec_workspace.py verify-full` to confirm nothing implemented
+   is being silently skipped and nothing still-a-stub is being silently
+   full-verified.

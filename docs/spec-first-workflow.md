@@ -139,3 +139,33 @@ runs separately.
    (optional, environment-specific — adapt or drop for your setup).
 6. Keep the JSON spec, generated Rustdoc, contracts, and any
    reference-implementation validation report together in the PR.
+7. Before a PR, run `spec_workspace.py check` (regenerates every spec under
+   `--specs-search-root` and diffs against committed output — catches drift
+   from hand-editing or a spec change that wasn't regenerated) and
+   `spec_workspace.py verify-full` (dispatches full verification per
+   concept, explicitly skipping any concept whose generated body still reads
+   `unimplemented!()` rather than silently attempting or silently passing
+   it).
+
+## Concept Dependencies
+
+`implements`/`trait_ref`/`variants` (Step 5/6, `kind: "trait"`/`"enum"`) are
+the only cross-concept links the generator itself resolves, and only for the
+one concept being built. When a constraint's correctness silently depends on
+another concept's behavior with no other structural place to say so, add a
+`depends_on: [{crate, concept, reason}]` entry — state the actual assumption
+in `reason`, not just a citation, so a reviewer changing the depended-on
+concept can tell whether this one needs re-review without reading its full
+spec.
+
+Before adding a concept that composes with existing ones, or before changing
+one that others may depend on, run:
+
+```bash
+python3 spec_workspace.py --specs-search-root <path> discover
+python3 spec_workspace.py --specs-search-root <path> impact <crate>::<Concept>
+```
+
+`impact` prints every concept that depends on the given one, directly or
+transitively, across `implements`/`trait_ref`/`variants`/`depends_on` —
+turning "what might this break" from a memory exercise into a command.

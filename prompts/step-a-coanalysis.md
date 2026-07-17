@@ -29,6 +29,16 @@ Goal: produce one JSON concept artifact that conforms to
     concepts should stay `kind: "struct"`. See SKILL.md's "Concept kinds"
     section and `tests/fixtures/trait_enum_demo/` for the schema shape
     (`implements`, `trait_ref`, `variants`) and a worked example.
+2b. **Optional: concept dependencies.** If this concept composes with, or
+    already-existing concepts in the workspace, or if a constraint's
+    correctness silently assumes another concept's invariant with no other
+    structural place to say so, run `spec_workspace.py discover` and
+    `spec_workspace.py impact <crate>::<Concept>` on anything it will depend
+    on first, and add a `depends_on: [{crate, concept, reason}]` entry -- a
+    real reason, not just a citation, so a reviewer changing the depended-on
+    concept later can tell whether this one needs re-review. Prefer
+    `implements`/`trait_ref`/`variants` when the relationship already fits
+    there; `depends_on` is for dependencies with no other structural home.
 3. Write the concept's `english_description` without implementation
    vocabulary.
 4. Write queries as pure observations. Each query needs `english`,
